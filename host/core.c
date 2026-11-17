@@ -210,7 +210,22 @@ uint32_t host_language_override(uint32_t game_choice) {
    pixel throughput (Galaxy A17 main menu: ~12.5 fps at 1080p, ~17 at 720p; level 1: ~24 at 720p, ~32 at 540p). */
 static void video_size(uint32_t *w, uint32_t *h) {
 #ifdef __ANDROID__
-    unsigned a = 960, b = 540;   /* level 1 on the Galaxy A17: ~24 fps at 720p (GPU fill bound), ~32 fps at 540p */
+    /* 540 lines (level 1 on the Galaxy A17: ~24 fps at 720p, GPU fill bound), as wide as the screen's shape so the
+       picture fills it: 1170x540 on a 19.5:9 phone, 864x540 on 16:10. Found once (the game keeps its mode). */
+    static unsigned sw, sh;
+    if (!sw) {
+        extern int android_screen_size(int *w, int *h);
+        /* the start screen's Resolution setting (GameActivity: Quality 540, Performance 432) or env.txt */
+        const char *e = getenv("RC_RENDER_HEIGHT");
+        sh = e && atoi(e) >= 240 && atoi(e) <= 1080 ? (unsigned)atoi(e) & ~1u : 540;
+        int W = 0, H = 0;
+        sw = android_screen_size(&W, &H) ? (unsigned)(((long long)sh * W / H + 1) & ~1LL) : sh * 16 / 9;
+        if (sw < sh * 4 / 3) sw = sh * 4 / 3;       /* 4:3 at the narrowest */
+        if (sw > sh * 12 / 5) sw = sh * 12 / 5;     /* 2.4:1 at the widest */
+        sw &= ~1u;
+        fprintf(stderr, "[video] game resolution %ux%u (screen %dx%d)\n", sw, sh, W, H);
+    }
+    unsigned a = sw, b = sh;
 #else
     unsigned a = 1920, b = 1080;
 #endif

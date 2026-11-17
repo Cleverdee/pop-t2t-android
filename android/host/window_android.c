@@ -228,6 +228,19 @@ void android_present_end(void) {
     pthread_mutex_unlock(&g_surf_lock);
 }
 
+/* the screen's size in pixels (landscape), waiting up to 3 s for the surface; 0 if there is none yet */
+int android_screen_size(int *w, int *h) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 3;
+    pthread_mutex_lock(&g_surf_lock);
+    while (!g_surf_ok && pthread_cond_timedwait(&g_surf_cond, &g_surf_lock, &ts) == 0) {}
+    int ok = g_surf_ok && g_window_w > 0 && g_window_h > 0;
+    if (ok) { *w = g_window_w > g_window_h ? g_window_w : g_window_h; *h = g_window_w > g_window_h ? g_window_h : g_window_w; }
+    pthread_mutex_unlock(&g_surf_lock);
+    return ok;
+}
+
 JNIEXPORT void JNICALL Java_com_cleverdee_pop3_GameSurface_nativeSurfaceReady(JNIEnv *env, jclass cls,
                                                                                        jobject surface) {
     (void)cls;
@@ -302,6 +315,13 @@ JNIEXPORT jint JNICALL Java_com_cleverdee_pop3_TouchOverlay_nativeGamePhase(JNIE
     (void)env; (void)cls;
     extern int gamephase_current(void);
     return gamephase_current();
+}
+
+/* the Skip button: end the movie that is playing (host/bink.c) */
+JNIEXPORT void JNICALL Java_com_cleverdee_pop3_TouchOverlay_nativeSkipMovie(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    extern void bink_skip(void);
+    bink_skip();
 }
 
 /* a tap on the picture in a menu: the game's cursor is steered there and clicks (host/gamephase.c) */

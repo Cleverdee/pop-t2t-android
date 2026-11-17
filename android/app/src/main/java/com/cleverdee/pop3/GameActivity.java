@@ -42,6 +42,11 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
             catch (java.io.IOException io) { /* no report then */ }
             if (prev != null) prev.uncaughtException(t, e);
         });
+        /* Resolution (MenuActivity): the lines the game renders, read by host/core.c and host/render_wgpu.c */
+        try {
+            int lines = getSharedPreferences("settings", MODE_PRIVATE).getInt("render_height", 540);
+            android.system.Os.setenv("RC_RENDER_HEIGHT", Integer.toString(lines), true);
+        } catch (android.system.ErrnoException e) { /* the default then */ }
         super.onCreate(savedInstanceState);
         sRunning = true;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

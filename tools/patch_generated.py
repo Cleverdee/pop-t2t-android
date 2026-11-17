@@ -39,4 +39,21 @@ for w, h in ((0x320, 0x258), (0x400, 0x300)):
         if n:
             open(f, "w").write(s2)
             done += n
+# Two Thrones: the Hardware.INI Resolutions parser (FUN_00418bf0) keeps only 4:3 and 16:9 modes (|w/h - r| < 0.001), so
+# a phone-shaped mode (1170x540 on 19.5:9) was dropped and the game quit (FindAvailableDisplayMode, ExitProcess 1001).
+# Its 16:9 compare takes the host's shape instead.
+for f in glob.glob(sys.argv[1] + "/*.c"):
+    s = open(f).read()
+    if "void f_00418bf0(" not in s:
+        continue
+    i = s.index("void f_00418bf0(")
+    j = s.index("\n}\n", i)
+    body = s[i:j]
+    old = "RF64((uint32_t)(0x97d148u))); /* fsub qword ptr [0x97d148] */"
+    new = ("({ extern uint32_t host_video_width(void), host_video_height(void); "
+           "(double)host_video_width() / (double)host_video_height(); })); /* fsub qword ptr [0x97d148] (host shape) */")
+    if body.count(old) == 1:
+        open(f, "w").write(s[:i] + body.replace(old, new) + s[j:])
+        done += 1
+
 print(f"patch_generated: {done} patch(es)")

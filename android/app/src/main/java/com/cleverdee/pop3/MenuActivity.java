@@ -105,6 +105,15 @@ public class MenuActivity extends Activity {
         Ui.clear(mRoot);
         Ui.title(mRoot, "for Android");
         button("Play", v -> { startActivity(new Intent(this, GameActivity.class)); finish(); });
+        /* Resolution: Sharp renders 540 lines, Fast 432 (~36% fewer pixels: smoother with lots of effects) */
+        final android.content.SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        final Ui.MenuButton res = Ui.button(mRoot, "Resolution", true, null);
+        res.setNote(prefs.getInt("render_height", 540) == 540 ? "SHARP" : "FAST");
+        res.setOnClickListener(v -> {
+            int next = prefs.getInt("render_height", 540) == 540 ? 432 : 540;
+            prefs.edit().putInt("render_height", next).apply();
+            res.setNote(next == 540 ? "SHARP" : "FAST");
+        });
         if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
             Ui.button(mRoot, "Game files", true, v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
         Ui.button(mRoot, "Check for updates", true, v -> { startActivity(new Intent(this, UpdateActivity.class)); finish(); });

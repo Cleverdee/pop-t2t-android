@@ -1307,6 +1307,8 @@ static void end_pass(void) {
 #define BG_CACHE 4096
 #define BG_PROBES 8
 typedef struct { WGPUTextureView v[4]; uint32_t s[4]; WGPUBindGroup bg; uint32_t stamp; } BgEntry;
+static uint32_t g_bg_freed;   /* bind groups released so far: a new one may reuse a freed one's address (exec_draw's state cache) */
+static uint32_t g_pass_gen;   /* render passes begun (exec_draw's state cache) */
 static BgEntry g_bgc[BG_CACHE];
 static uint32_t g_bg_stamp;
 uint32_t g_gpu_bind_groups_made;   /* for the [mem] log */
@@ -1320,6 +1322,7 @@ static void bg_forget_view(WGPUTextureView view) {
         BgEntry *e = &g_bgc[i];
         if (e->bg && (e->v[0] == view || e->v[1] == view || e->v[2] == view || e->v[3] == view)) {
             wgpuBindGroupRelease(e->bg);   /* recorded commands keep their own reference */
+            g_bg_freed++;
             e->bg = NULL;
         }
     }
@@ -1550,6 +1553,7 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     g_st.passes++;
     if (!(clear & 1)) g_st.passes_load++;
     g_pass = wgpuCommandEncoderBeginRenderPass(g_enc, &rp);
+    g_pass_gen++;   /* a fresh pass has no state bound: exec_draw's cache of what is set starts over */
 }
 
 /* ------------------------------------------------------------------ render targets */
@@ -2010,7 +2014,7 @@ static void exec_draw(const CmdDraw *c) {
         bgd.layout = g_bgl_t; bgd.entryCount = 8; bgd.entries = te;
         bg = wgpuDeviceCreateBindGroup(g_dev, &bgd);
         g_gpu_bind_groups_made++;
-        if (victim->bg) wgpuBindGroupRelease(victim->bg);
+        if (victim->bg) { wgpuBindGroupRelease(victim->bg); g_bg_freed++; }
         memcpy(victim->v, views, sizeof victim->v);
         memcpy(victim->s, c->samp_key, sizeof victim->s);
         victim->bg = bg;
@@ -2036,12 +2040,27 @@ static void exec_draw(const CmdDraw *c) {
     static int skip = -1;
     if (skip < 0) skip = getenv("RC_SKIP_DRAWS") ? atoi(getenv("RC_SKIP_DRAWS")) : 0;
     if (skip == 1 || (skip == 2 && c->key.vs)) return;
-    wgpuRenderPassEncoderSetViewport(g_pass, vx, vy, vw, vh, c->minz, c->maxz);
-    wgpuRenderPassEncoderSetPipeline(g_pass, p);
-    if (k.sten & 1) wgpuRenderPassEncoderSetStencilReference(g_pass, c->stencil_ref);
+    /* State already set in this pass isn't set again: each encoder call costs wgpu validation and tracking on the
+       CPU, and consecutive draws mostly share viewport, pipeline and textures (RC_NO_STATE_CACHE=1 sets everything). */
+    static struct { uint32_t gen; float vp[6]; WGPURenderPipeline pipe; uint32_t sref; int sref_ok; WGPUBindGroup bg1;
+                    uint32_t bg_freed; } S;
+    static int nocache = -1;
+    if (nocache < 0) nocache = getenv("RC_NO_STATE_CACHE") != NULL;
+    if (S.gen != g_pass_gen || nocache) { memset(&S, 0, sizeof S); S.gen = g_pass_gen; S.vp[2] = -1; }
+    if (S.vp[0] != vx || S.vp[1] != vy || S.vp[2] != vw || S.vp[3] != vh || S.vp[4] != c->minz || S.vp[5] != c->maxz) {
+        wgpuRenderPassEncoderSetViewport(g_pass, vx, vy, vw, vh, c->minz, c->maxz);
+        S.vp[0] = vx; S.vp[1] = vy; S.vp[2] = vw; S.vp[3] = vh; S.vp[4] = c->minz; S.vp[5] = c->maxz;
+    }
+    if (S.pipe != p) { wgpuRenderPassEncoderSetPipeline(g_pass, p); S.pipe = p; }
+    if ((k.sten & 1) && (!S.sref_ok || S.sref != c->stencil_ref)) {
+        wgpuRenderPassEncoderSetStencilReference(g_pass, c->stencil_ref);
+        S.sref = c->stencil_ref; S.sref_ok = 1;
+    }
     uint32_t off = g_upos;
-    wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 1, &off);
-    wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL);   /* owned by the cache */
+    wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 1, &off);   /* this draw's uniforms: a new offset each time */
+    if (S.bg1 != bg || S.bg_freed != g_bg_freed) {   /* owned by the cache */
+        wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL); S.bg1 = bg; S.bg_freed = g_bg_freed;
+    }
     if (vs_consts) {
         memcpy(g_cstage + g_cpos, vs_consts, CSTRIDE);
         uint32_t coff = g_cpos;

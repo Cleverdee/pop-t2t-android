@@ -42,6 +42,7 @@ public class TouchOverlay extends View {
     static native void nativeTouchPad(int buttons, int lx, int ly);
     static native void nativeTouchMouse(int button, int dx, int dy);   /* button: -1 none, 0 up, 1 down */
     static native int nativeFps();
+    static native void nativeSkipMovie();   /* host/bink.c: the playing movie jumps to its end */
     static native void nativeMenuTap(float nx, float ny);   /* host/gamephase.c: steer the menu cursor there and click */
     static native int nativeGamePhase();   /* host/gamephase.c PH_*: see phaseLayout() */
     static native int nativeNetState();   /* multiplayer: 0 off, 1 fine, 2 waiting, 3 other player gone, 4 out of sync */
@@ -99,7 +100,7 @@ public class TouchOverlay extends View {
        intro), so it sends Escape, the pad's A and a left click at once */
     private static Btn skipButton() {
         Btn b = new Btn("skip", "Skip", I_SKIP, 1 << A, 0, true, 1.45f, 1.45f, 0.58f);
-        b.key = HID_SKIP; b.mouse = 1;
+        /* only the host's skip (nativeSkipMovie): an Escape or click would reach the game once the movie is over */
         return b;
     }
     /* HID usages (SDL scancodes) */
@@ -537,6 +538,7 @@ public class TouchOverlay extends View {
         }
         if ((b.flags & F_KEYBOARD) != 0) { toggleKeyboard(); return; }
         if ((b.flags & F_TOGGLE) != 0) { b.on = !b.on; return; }
+        if (b.icon == I_SKIP) nativeSkipMovie();
         if (b.key != 0) nativeKey(b.key, true);
         if (b.mouse != 0) nativeTouchMouse(b.mouse == 2 ? 3 : 1, 0, 0);
         mHeld.put(pointer, b);

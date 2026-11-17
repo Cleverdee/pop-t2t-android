@@ -592,14 +592,32 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         g_cam_seen = 1;
     }
     {   /* debugging: <game>/../hide.txt "lo hi" drops draws lo..hi of each frame (checked every 30 frames; delete the file to stop) */
+        /* or a group of draws by name, to measure what a kind of draw costs (with RC_GPU_TIMES=1): "light" (additive
+           ONE/ONE passes, e.g. Warrior Within's per-light redraws), "atest" (alpha-tested), "blend" (other blended),
+           "opaque" (neither) */
         static uint32_t lo = 1, hi = 0, chk;
+        static int grp;   /* 0 none, 1 light, 2 atest, 3 blend, 4 opaque */
         if (++chk % 2000 == 0) {
             char hp[4200]; snprintf(hp, sizeof hp, "%s/../hide.txt", g_game_root);
             FILE *f = fopen(hp, "r");
-            lo = 1; hi = 0;
-            if (f) { if (fscanf(f, "%u %u", &lo, &hi) != 2) { lo = 1; hi = 0; } fclose(f); }
+            lo = 1; hi = 0; grp = 0;
+            if (f) {
+                char w[16] = { 0 };
+                if (fscanf(f, "%u %u", &lo, &hi) != 2) {
+                    lo = 1; hi = 0;
+                    rewind(f);
+                    if (fscanf(f, "%15s", w) == 1)
+                        grp = !strcmp(w, "light") ? 1 : !strcmp(w, "atest") ? 2 : !strcmp(w, "blend") ? 3 : !strcmp(w, "opaque") ? 4 : 0;
+                }
+                fclose(f);
+            }
         }
         if (g_f_drawn - 1 >= lo && g_f_drawn - 1 <= hi) return;
+        if (grp) {
+            int blend = st->rs[27] != 0, light = blend && st->rs[19] == 2 && st->rs[20] == 2, atest = st->rs[15] != 0;
+            int g = light ? 1 : atest ? 2 : blend ? 3 : 4;
+            if (g == grp) return;
+        }
     }
     {   /* debugging: RC_SKIP_PS=<hex handle>: drop draws that use that pixel shader */
         static long skip_ps = -1;
