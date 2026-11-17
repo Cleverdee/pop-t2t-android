@@ -768,7 +768,7 @@ static int known_add(uint64_t h) {   /* 1 if it wasn't known yet */
 }
 
 /* pipelines from the file: p is NULL while being built; taken once pipeline_for owns it (or builds it) */
-#define NWARM 4096
+#define NWARM 16384
 typedef struct { WKey w; WGPURenderPipeline p; int used, taken, pending; } WEntry;   /* pending: queued for the async builder */
 static WEntry g_warm[NWARM];
 static WEntry *warm_slot(const WKey *w) {
@@ -941,7 +941,7 @@ static VsGpu *vs_gpu(uint32_t handle) {
 /* ------------------------------------------------------------------ pipelines */
 
 typedef struct { PKey k; WGPURenderPipeline p; } PEntry;
-#define NPIPES 2048
+#define NPIPES 16384   /* one per state combination seen; Warrior Within passes 2048 below deck (draws were skipped when full) */
 static PEntry g_pipes[NPIPES];
 
 static WGPUBlendFactor bf(uint32_t b) {
@@ -1161,9 +1161,12 @@ static WGPURenderPipeline pipeline_for(const PKey *k) {
             return e->p;
         }
     }
-    static int warned;
-    if (!warned++) fprintf(stderr, "[wgpu] pipeline cache full\n");
-    return NULL;
+    /* full: start the table over rather than skip draws (that hid Warrior Within's hull below deck); the pipelines
+       themselves live on in the warm table (g_warm), so refilling the map is cheap */
+    static int resets;
+    fprintf(stderr, "[wgpu] pipeline table full (%d entries): emptied (%d)\n", NPIPES, ++resets);
+    memset(g_pipes, 0, sizeof g_pipes);   /* only the handle->pipeline map: the pipelines stay owned by the warm table */
+    return pipeline_for(k);
 }
 
 #ifndef __EMSCRIPTEN__

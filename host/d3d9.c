@@ -852,7 +852,7 @@ W(dev_ProcessVertices) { RET(7, S_OK); }
 /* Shaders. A Shader is the host copy of a vertex declaration, a vertex shader or a pixel shader; the
    renderer works with "handles" (odd numbers) that name a table slot, and with a vertex declaration and a
    vertex shader bound together the handle names a combined Shader (see bind_vertex). */
-#define MAX_SHADERS 4096
+#define MAX_SHADERS 32768
 static Shader *g_shaders[MAX_SHADERS];
 Shader *shader_get(uint32_t h) {
     uint32_t i = (h - 0x10001u) / 2;
@@ -867,9 +867,63 @@ static uint32_t copy_tokens(uint32_t p, uint32_t end_token, uint32_t **out) {
     memcpy(*out, HP(p), 4 * n);
     return n;
 }
+static uint32_t g_nshaders;   /* slots are never freed: the next free one is the count */
 static uint32_t new_shader(Shader *s) {
-    for (uint32_t i = 0; i < MAX_SHADERS; i++) if (!g_shaders[i]) { g_shaders[i] = s; return s->handle = 0x10001u + 2 * i; }
+    if (g_nshaders < MAX_SHADERS) { g_shaders[g_nshaders] = s; return s->handle = 0x10001u + 2 * g_nshaders++; }
+    static int warned;
+    if (!warned++) fprintf(stderr, "[d3d] shader table full (%d): draws will lose their vertex layout\n", MAX_SHADERS);
     return 0;
+}
+
+/* Shaders are interned by content (pixel flag, code tokens, declaration elements): games create the same shader
+   again and again (Warrior Within: thousands of identical vertex shaders), and every one used to take a table slot
+   until the table was full. Shaders are never freed, so sharing one is safe. */
+static Shader **g_intern;
+static uint32_t g_intern_cap, g_intern_n;
+static uint64_t shader_hash(const Shader *s) {
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)s->pixel;
+    const uint8_t *b = (const uint8_t *)s->code;
+    for (uint32_t i = 0; b && i < 4 * s->code_len; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    h = (h ^ 0xFF) * 0x100000001b3ull;
+    b = (const uint8_t *)s->elems;
+    for (uint32_t i = 0; b && i < 8 * s->n_elems; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+static int shader_same(const Shader *a, const Shader *b) {
+    if (a->pixel != b->pixel || a->code_len != b->code_len || a->n_elems != b->n_elems) return 0;
+    if (!!a->code != !!b->code || !!a->elems != !!b->elems) return 0;
+    if (a->code && memcmp(a->code, b->code, 4 * a->code_len)) return 0;
+    if (a->elems && memcmp(a->elems, b->elems, 8 * a->n_elems)) return 0;
+    return 1;
+}
+static Shader *intern_find(const Shader *s) {
+    if (!g_intern_cap) return NULL;
+    for (uint32_t i = (uint32_t)shader_hash(s) & (g_intern_cap - 1); g_intern[i]; i = (i + 1) & (g_intern_cap - 1))
+        if (shader_same(g_intern[i], s)) return g_intern[i];
+    return NULL;
+}
+static void intern_add(Shader *s) {
+    if (2 * (g_intern_n + 1) > g_intern_cap) {   /* grow: rehash into twice the room */
+        uint32_t cap = g_intern_cap ? 2 * g_intern_cap : 4096;
+        Shader **t = calloc(cap, sizeof *t);
+        for (uint32_t k = 0; k < g_intern_cap; k++) if (g_intern[k]) {
+            uint32_t i = (uint32_t)shader_hash(g_intern[k]) & (cap - 1);
+            while (t[i]) i = (i + 1) & (cap - 1);
+            t[i] = g_intern[k];
+        }
+        free(g_intern); g_intern = t; g_intern_cap = cap;
+    }
+    uint32_t i = (uint32_t)shader_hash(s) & (g_intern_cap - 1);
+    while (g_intern[i]) i = (i + 1) & (g_intern_cap - 1);
+    g_intern[i] = s; g_intern_n++;
+}
+/* a freshly built shader, or the identical one made before (then this one is freed) */
+static Shader *intern_shader(Shader *s) {
+    Shader *e = intern_find(s);
+    if (e) { free(s->code); free(s->elems); free(s->decl); free(s); return e; }
+    new_shader(s);
+    intern_add(s);
+    return s;
 }
 static Shader *shader_obj(uint32_t obj) { return obj ? com_data(obj) : NULL; }
 
@@ -930,7 +984,7 @@ W(dev_CreateVertexDeclaration) {
     s->elems = malloc(8 * n); s->n_elems = n;
     memcpy(s->elems, HP(ARG(1)), 8 * n);
     s->decl_len = declaration_tokens(s->elems, NULL, &s->decl);
-    new_shader(s);
+    s = intern_shader(s);
     if (g_log_d3d) {
         fprintf(stderr, "[d3d] CreateVertexDeclaration:");
         for (uint32_t k = 0; k + 1 < n; k++) {
@@ -946,7 +1000,7 @@ W(dev_CreateVertexDeclaration) {
 W(dev_CreateVertexShader) {
     Shader *s = calloc(1, sizeof *s);
     s->code_len = copy_tokens(ARG(1), 0x0000FFFFu, &s->code);
-    new_shader(s);
+    s = intern_shader(s);
     if (g_log_d3d) fprintf(stderr, "[d3d] CreateVertexShader: %u tokens (version %08x)\n", s->code_len, s->code ? s->code[0] : 0);
     W32(ARG(2), com_new(&IDirect3DVertexShader9_i, RT_SHADER, s));
     RET(3, S_OK);
@@ -955,15 +1009,13 @@ W(dev_CreatePixelShader) {
     Shader *s = calloc(1, sizeof *s);
     s->pixel = 1;
     s->code_len = copy_tokens(ARG(1), 0x0000FFFFu, &s->code);
-    new_shader(s);
+    s = intern_shader(s);
     if (g_log_d3d) fprintf(stderr, "[d3d] CreatePixelShader: %u tokens (version %08x)\n", s->code_len, s->code ? s->code[0] : 0);
     W32(ARG(2), com_new(&IDirect3DPixelShader9_i, RT_SHADER, s));
     RET(3, S_OK);
 }
 
 /* Binds what the renderer calls st.vs: a shader handle when a declaration is set, otherwise the FVF. */
-static Shader *g_combos[256];
-static int g_ncombos;
 static void bind_vertex(Device *d) {
     Shader *decl = shader_obj(d->st.vdecl), *code = shader_obj(d->st.vshader);
     if (!decl) { d->st.vs = d->st.fvf; return; }
@@ -981,8 +1033,13 @@ static void bind_vertex(Device *d) {
         if (fvf & 0x4) { d->st.vs = fvf | (ntex << 8); return; }
     }
     if (!code) { d->st.vs = decl->handle; return; }
-    for (int i = 0; i < g_ncombos; i++)
-        if (g_combos[i]->elems == decl->elems && g_combos[i]->code == code->code) { d->st.vs = g_combos[i]->handle; return; }
+    {   /* the pair, by content (code tokens + declaration elements) */
+        Shader probe;
+        memset(&probe, 0, sizeof probe);
+        probe.code = code->code; probe.code_len = code->code_len; probe.elems = decl->elems; probe.n_elems = decl->n_elems;
+        Shader *e = intern_find(&probe);
+        if (e) { d->st.vs = e->handle; return; }
+    }
     Shader *s = calloc(1, sizeof *s);
     DclMap map;
     memset(&map, 0xFF, sizeof map);
@@ -1002,16 +1059,16 @@ static void bind_vertex(Device *d) {
         static const uint8_t np[26] = { 0, 2, 3, 3, 4, 3, 2, 2, 3, 3, 3, 3, 3, 3, 2, 2, 2, 3, 4, 2, 3, 3, 3, 3, 3, 0 };
         i += op < 26 ? np[op] : 0;
     }
-    s->code = code->code; s->code_len = code->code_len;
-    s->elems = decl->elems; s->n_elems = decl->n_elems;   /* (the cache key above) */
+    s->code_len = code->code_len; s->code = malloc(4 * s->code_len); memcpy(s->code, code->code, 4 * s->code_len);
+    s->n_elems = decl->n_elems; s->elems = malloc(8 * s->n_elems); memcpy(s->elems, decl->elems, 8 * s->n_elems);   /* (the key) */
     if (have_dcl && decl->elems) { s->decl_len = declaration_tokens(decl->elems, &map, &s->decl); }
     else { s->decl = decl->decl; s->decl_len = decl->decl_len; }
-    new_shader(s);
+    if (!have_dcl || !decl->elems) { s->decl = malloc(4 * s->decl_len); memcpy(s->decl, decl->decl, 4 * s->decl_len); }   /* own copy */
+    s = intern_shader(s);
     if (g_log_d3d) {
         for (uint32_t k = 0; decl->elems && k + 1 < decl->n_elems; k++)
             if (((const uint8_t *)decl->elems)[8 * k + 6] == 9) { fprintf(stderr, "[d3d] shader %x uses POSITIONT (screen-space UI)\n", s->handle); break; }
     }
-    if (g_ncombos < 256) g_combos[g_ncombos++] = s;
     d->st.vs = s->handle;
 }
 W(dev_SetVertexDeclaration) { Device *d = dev(c); d->st.vdecl = ARG(1); bind_vertex(d); RET(2, S_OK); }

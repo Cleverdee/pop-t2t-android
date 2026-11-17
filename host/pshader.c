@@ -134,8 +134,9 @@ char *ps_to_wgsl(const uint32_t *code, uint32_t n, char *why, size_t why_n) {
             case 65: put(&b, "  kill = kill || any(i.tc%u.xyz < vec3<f32>(0.0));\n", dnum); break;
             case 66: put(&b, "  t%u = textureSample(tex%u, smp%u, ptc(i.tc%u, %uu));\n", dnum, dnum, dnum, dnum, dnum); break;
             case 67: case 68:
-                put(&b, "  t%u = textureSample(tex%u, smp%u, i.tc%u.xy + vec2<f32>(u.bem[%u].x * t%u.x + u.bem[%u].z * t%u.y, "
-                        "u.bem[%u].y * t%u.x + u.bem[%u].w * t%u.y));\n", dnum, dnum, dnum, dnum, dnum, m, dnum, m, dnum, m, dnum, m);
+                /* the coordinates are projected first (D3DTTFF_PROJECTED: WW's refraction reads the screen copy so) */
+                put(&b, "  t%u = textureSample(tex%u, smp%u, ptc(i.tc%u, %uu) + vec2<f32>(u.bem[%u].x * t%u.x + u.bem[%u].z * t%u.y, "
+                        "u.bem[%u].y * t%u.x + u.bem[%u].w * t%u.y));\n", dnum, dnum, dnum, dnum, dnum, dnum, m, dnum, m, dnum, m, dnum, m);
                 if (op == 68) put(&b, "  t%u = vec4<f32>(t%u.xyz * saturate(t%u.z * u.bel[%u].x + u.bel[%u].y), t%u.w);\n",
                                   dnum, dnum, m, dnum, dnum, dnum);
                 break;
