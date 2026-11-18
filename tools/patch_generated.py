@@ -56,4 +56,25 @@ for f in glob.glob(sys.argv[1] + "/*.c"):
         open(f, "w").write(s[:i] + body.replace(old, new) + s[j:])
         done += 1
 
+# Both games: the menu slider draw code (WW FUN_008355d0, T2T the same code at 0x8cfe5f) places the knob at
+# (value - min) * width / (max - min). On Android the host offers a single resolution, so the Graphics page's
+# resolution slider has max == min and the idiv trapped (divide by zero) as soon as the page opened.
+# A zero range now puts the knob at the start.
+for f in glob.glob(sys.argv[1] + "/*.c"):
+    s = open(f).read()
+    s2 = s
+    for addr in ("0x0083582bu", "0x008cfe5fu"):
+        trap = 'guest_trap(c, %s, "divide by zero"); }' % addr
+        k = s2.find(trap)
+        if k < 0 or "imul eax, ebx" not in s2[k - 2000:k]:
+            continue
+        a = s2.rfind("if (!d_) {", 0, k)
+        s2 = s2[:a] + "if (!d_) { r->eax = 0; r->edx = 0; } else {" + s2[k + len(trap):]
+        # close the else after the division
+        e = s2.find("} /* idiv dword ptr [esp + 0x18] */", a)
+        s2 = s2[:e] + "} } /* idiv dword ptr [esp + 0x18] (zero range -> 0) */" + s2[e + len("} /* idiv dword ptr [esp + 0x18] */"):]
+        done += 1
+    if s2 != s:
+        open(f, "w").write(s2)
+
 print(f"patch_generated: {done} patch(es)")
