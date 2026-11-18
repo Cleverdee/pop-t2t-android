@@ -21,6 +21,49 @@
 static LoadedImage g_img;
 static CPU g_cpu;
 
+/* A packed exe (GOG's, UPX): the game starts in the exe's own unpacker stub, translated by tools/upx_stub.py
+   (out_upx/upx_stub.c). It decompresses the game into the image, fills the import table through LoadLibraryA /
+   GetProcAddress (host/kernel32.c g_upx_binding) and jumps to the original entry point, the translated game.
+   There the image is compared with the unpacked exe the game was translated from. Weak: builds without the
+   generated file still link (and refuse packed exes). */
+extern const uint32_t upx_stub_entry __attribute__((weak)), upx_oep __attribute__((weak));
+extern const uint32_t upx_check[][2] __attribute__((weak)), upx_ncheck __attribute__((weak));
+extern const uint64_t upx_check_hash __attribute__((weak));
+void register_upx_stub(void) __attribute__((weak));
+extern int g_upx_binding, g_image_packed;   /* host/kernel32.c, runtime.c */
+static GuestFn g_game_entry;
+
+static void upx_at_original_entry(CPU *c) {
+    g_upx_binding = 0;
+    register_function(upx_oep, g_game_entry);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < upx_ncheck; i++)
+        for (const uint8_t *p = HP(upx_check[i][0]), *e = HP(upx_check[i][1]); p < e; p++)
+            h = (h ^ *p) * 0x100000001b3ull;
+    if (h == upx_check_hash)
+        fprintf(stderr, "[upx] game unpacked: the image matches the translated exe\n");
+    else
+        fprintf(stderr, "[upx] WARNING: the unpacked image differs from the translated exe (%016llx, expected %016llx)\n",
+                (unsigned long long)h, (unsigned long long)upx_check_hash);
+    g_game_entry(c);
+}
+
+/* 0 if the packed exe can be started at its stub; otherwise a message for the player */
+static const char *upx_prepare(void) {
+    if (!register_upx_stub || !&upx_stub_entry || !upx_stub_entry)
+        return "This build can't run a packed (UPX) game exe. Unpack it on a PC first (PrepareGame.bat).";
+    if (g_img.entry != upx_stub_entry)
+        return "The game exe is packed (UPX) but isn't the GOG version this app knows. "
+               "Unpack it on a PC first (PrepareGame.bat), or use the GOG exe.";
+    register_upx_stub();
+    g_game_entry = lookup_function(upx_oep);
+    if (!g_game_entry) return "The packed exe's original entry point was not recompiled.";
+    register_function(upx_oep, upx_at_original_entry);
+    g_upx_binding = 1;
+    fprintf(stderr, "[upx] packed exe: starting at its unpacker stub %08x (game entry %08x)\n", upx_stub_entry, upx_oep);
+    return NULL;
+}
+
 /* RC_WATCHDOG=secs: periodically print the game thread's guest call stack (return addresses found
    on its stack), to see where it is when it seems stuck. */
 static void *watchdog(void *arg) {
@@ -168,6 +211,16 @@ int main(int argc, char **argv) {
     if (load_image(exe, &g_img)) return 1;
     register_all_functions();
     fprintf(stderr, "loaded %s: %u imports, %u of them implemented\n", exe, g_img.num_imports, n);
+    if (g_image_packed) {
+        const char *why = upx_prepare();
+        if (why) {
+            fprintf(stderr, "%s\n", why);
+#ifdef __ANDROID__
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, PROFILE_TITLE, why, NULL);
+#endif
+            return 1;
+        }
+    }
 
     /* The window and its event loop must live on the main thread (macOS); the game gets its own
        thread. RC_HEADLESS=1 runs without a window (no rendering, 60 Hz pacing). */

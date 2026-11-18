@@ -42,8 +42,39 @@ static uint32_t module_for(const char *name) {
     return 0;
 }
 
+/* While a packed exe's UPX stub fills the game's import table (host/main.c), LoadLibraryA and GetProcAddress bind
+   every DLL!function exactly as the PE loader binds an unpacked exe (runtime.c bind_import): same names, ordinals
+   included, and a trapping slot for imports the host lacks instead of a failure (the stub would exit). The module
+   handles are only seen by the stub. */
+int g_upx_binding;
+uint32_t bind_import(const char *name);   /* runtime.c: a slot for "DLL!name" / "DLL!#ordinal" as the PE loader binds it */
+#define UPX_MODULE(i) (0xF8000000u + (i) * 0x10000u)
+static char g_upx_dll[64][64];
+static uint32_t g_upx_ndll;
+
+static uint32_t upx_module(const char *name) {
+    for (uint32_t i = 0; i < g_upx_ndll; i++)
+        if (!strcasecmp(g_upx_dll[i], name)) return UPX_MODULE(i);
+    if (g_upx_ndll == 64) return 0;
+    snprintf(g_upx_dll[g_upx_ndll], sizeof g_upx_dll[0], "%s", name);
+    for (char *p = g_upx_dll[g_upx_ndll]; *p; p++) *p = (char)toupper((unsigned char)*p);
+    return UPX_MODULE(g_upx_ndll++);
+}
+
+static uint32_t upx_proc(uint32_t mod, uint32_t name) {
+    uint32_t i = (mod - UPX_MODULE(0)) / 0x10000u;
+    if (mod < UPX_MODULE(0) || i >= g_upx_ndll) return 0;
+    char full[160];
+    if (name < 0x10000) snprintf(full, sizeof full, "%s!#%u", g_upx_dll[i], name);
+    else snprintf(full, sizeof full, "%s!%s", g_upx_dll[i], GSTR(name));
+    uint32_t r = bind_import(full);
+    LOG("[upx] %s -> %08x%s\n", full, r, find_import_handler(full) ? "" : " (not implemented)");
+    return r;
+}
+
 W(GetModuleHandleA) { RET(1, ARG(0) ? module_for(GSTR(ARG(0))) : g_image_lo); }
 W(LoadLibraryA) {
+    if (g_upx_binding) { RET(1, upx_module(GSTR(ARG(0)))); }
     uint32_t m = module_for(GSTR(ARG(0)));
     LOG("[kernel32] LoadLibraryA(%s) -> %08x\n", GSTR(ARG(0)), m);
     set_error(m ? 0 : 126);
@@ -53,6 +84,7 @@ W(FreeLibrary) { RET(1, 1); }
 
 W(GetProcAddress) {
     uint32_t mod = ARG(0), name = ARG(1);
+    if (g_upx_binding) { RET(2, upx_proc(mod, name)); }
     char full[160];
     const char *dll = "KERNEL32.DLL";
     for (int i = 0; g_known_dlls[i]; i++)
@@ -389,7 +421,11 @@ W(VirtualAlloc) {
 W(VirtualFree) { RET(3, 1); }
 W(VirtualProtect) {
     /* Executable protections mark code the game generated or loaded itself (e.g. sound-engine plug-ins). */
-    if (ARG(2) & 0xf0) { LOG("[kernel32] VirtualProtect(%08x, %x, exec)\n", ARG(0), ARG(1)); dyncode_register(ARG(0), ARG(1)); }
+    /* (not the exe itself: a packed exe's UPX stub unprotects and restores its header page) */
+    if ((ARG(2) & 0xf0) && !(ARG(0) >= g_image_lo && ARG(0) < g_image_hi)) {
+        LOG("[kernel32] VirtualProtect(%08x, %x, exec)\n", ARG(0), ARG(1));
+        dyncode_register(ARG(0), ARG(1));
+    }
     if (ARG(3)) W32(ARG(3), 4 /* PAGE_READWRITE */);
     RET(4, 1);
 }

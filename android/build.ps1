@@ -7,6 +7,8 @@ Inputs (prepared once, see ..\..\README-ANDROID.md):
   ..\..\work\POP3.EXE        GOG pop3.exe after `upx -d` and tools\fix_gog_sections.py
   ..\..\work\functions.json  Ghidra export (ghidra\ExportFunctions.java)
   ..\out_all\                translator output (x86toc.py + tools\patch_generated.py); made here if missing
+  ..\..\work\POP3_packed.exe  GOG's exe as installed (UPX-packed): its unpacker stub is translated into ..\out_upx\
+                             (tools\upx_stub.py), so the app can start a packed exe; without it packed exes are refused
 
 Options:
   -Install        install the APK on the phone connected over USB
@@ -76,6 +78,22 @@ if ($Retranslate -or -not (Test-Path $Stamp) -or (Get-Content $Stamp) -ne $Hash)
     Set-Content -Path $Stamp -Value $Hash -Encoding ascii
 }
 Write-Host "  $((Get-ChildItem $OutAll -Filter *.c).Count) generated C files in out_all\"
+
+# GOG's packed exe: its own UPX unpacker stub, translated, so the app starts a packed exe as installed
+$Packed = Join-Path $Work "POP3_packed.exe"
+$UpxOut = Join-Path $Repo "out_upx"
+New-Item -ItemType Directory -Force $UpxOut | Out-Null
+$UpxC = Join-Path $UpxOut "upx_stub.c"
+$UpxNew = "$UpxC.new"
+if (Test-Path $Packed) {
+    Run "python" @("-I", (Join-Path $Repo "tools\upx_stub.py"), $Packed, $Exe, $UpxNew)
+} else {
+    Write-Host "  no $Packed (GOG's packed exe): the app will refuse packed exes" -ForegroundColor Yellow
+    Run "python" @("-I", (Join-Path $Repo "tools\upx_stub.py"), "--none", $UpxNew)
+}
+# replaced only when it changes, so it isn't recompiled every build
+if ((Test-Path $UpxC) -and ((Get-FileHash $UpxC).Hash -eq (Get-FileHash $UpxNew).Hash)) { Remove-Item $UpxNew }
+else { Move-Item -Force $UpxNew $UpxC }
 
 Step "Building the APK (first build compiles ~2M translated instructions: 20-60 minutes)"
 Set-Content -Path (Join-Path $Android "local.properties") -Value ("sdk.dir=" + ($Sdk -replace "\\", "/")) -Encoding ascii

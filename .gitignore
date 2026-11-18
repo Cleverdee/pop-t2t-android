@@ -1,5 +1,6 @@
 # Build outputs: generated C and binaries are derived from the game you build, never commit them
 out_all/
+out_upx/
 out_trace/
 build/
 build_web/

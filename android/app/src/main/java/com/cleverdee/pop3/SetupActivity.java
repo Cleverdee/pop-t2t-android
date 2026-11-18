@@ -78,7 +78,6 @@ public class SetupActivity extends Activity {
             new Thread(() -> unpack(wanted, todo, dir), "unpack").start();
             return;
         }
-        if (hasGame() && isPacked(new File(gameDir(), EXE)) && !getIntent().getBooleanExtra(EXTRA_MANAGE, false)) { showPacked(); return; }
         if (hasGame() && !getIntent().getBooleanExtra(EXTRA_MANAGE, false)) { startGame(); return; }
         showWelcome();
     }
@@ -130,7 +129,7 @@ public class SetupActivity extends Activity {
         text("1. On your PC, find the folder Prince of Persia: The Two Thrones is installed in. For the GOG copy it's "
            + "usually\nC:\\Program Files (x86)\\GOG Galaxy\\Games\\Prince of Persia The Two Thrones\n"
            + "and has pop3.exe, pop3.bf and the Video folder in it.", 15, SOFT);
-        text("2. The pop3.exe that GOG installs is packed (compressed), and this app needs it unpacked. " + "On your PC: download PrepareGame.zip from github.com/Cleverdee/pop-t2t-android/releases, put PrepareGame.bat in the game folder (next to pop3.exe) and double-click it. It fetches the official UPX tool and unpacks pop3.exe (the packed one is kept as pop3.exe.packed). Or run upx -d pop3.exe yourself.", 15, SOFT);
+        text("2. Copy pop3.exe as GOG installed it: the app runs the packed exe as it is. (One unpacked with PrepareGame.bat or upx -d works too.)", 15, SOFT);
         text("3. Copy that folder to your phone (with a USB cable, a memory card or any app you like), or zip it "
            + "first: right-click > Compress to > ZIP File.", 15, SOFT);
         text("4. Come back here, tap \"Choose a folder\" or \"Choose a .zip file\" and pick it.", 15, SOFT);
@@ -214,32 +213,6 @@ public class SetupActivity extends Activity {
 
     private static class Problem extends Exception { Problem(String m) { super(m); } }
 
-    /* GOG ships the exe packed with UPX (sections UPX0, UPX1): the recompiled game can't run it (it ends at once) */
-    static boolean isPacked(File exe) {
-        try (java.io.RandomAccessFile f = new java.io.RandomAccessFile(exe, "r")) {
-            byte[] h = new byte[4096];
-            int n = f.read(h);
-            if (n < 0x40) return false;
-            int pe = (h[0x3c] & 255) | (h[0x3d] & 255) << 8 | (h[0x3e] & 255) << 16;
-            if (pe <= 0 || pe + 24 > n) return false;
-            int nsec = (h[pe + 6] & 255) | (h[pe + 7] & 255) << 8;
-            int opt = (h[pe + 20] & 255) | (h[pe + 21] & 255) << 8;
-            for (int i = 0, t = pe + 24 + opt; i < nsec && t + 40 <= n; i++, t += 40)
-                if (h[t] == 'U' && h[t + 1] == 'P' && h[t + 2] == 'X') return true;
-        } catch (IOException e) { /* unreadable: let the game report it */ }
-        return false;
-    }
-    private static final String PACKED_STEPS = "On your PC: download PrepareGame.zip from github.com/Cleverdee/pop-t2t-android/releases, put PrepareGame.bat in the game folder (next to pop3.exe) and double-click it. It fetches the official UPX tool and unpacks pop3.exe (the packed one is kept as pop3.exe.packed). Or run upx -d pop3.exe yourself.";
-
-    private void showPacked() {
-        mBusy = false;
-        page();
-        Ui.heading(mRoot, "pop3.exe is still packed");
-        text("The pop3.exe in your game files is the packed one GOG installs, and the game can't start from it. "
-           + "Unpack it, then import the game files again.", 15, SOFT);
-        text(PACKED_STEPS, 15, SOFT);
-        button("Choose game files", v -> showWelcome());
-    }
     private static class Cancelled extends IOException { }
 
     private File stagingDir() { return new File(getExternalFilesDir(null), "game.import"); }
@@ -376,8 +349,6 @@ public class SetupActivity extends Activity {
         if (!exe.getName().equals(EXE) && !exe.renameTo(new File(root, EXE))) throw new IOException("rename " + exe);
         if (findChild(root, "pop3.bf") == null)
             throw new Problem("pop3.bf isn't next to POP3.EXE. Copy the whole installed game folder.");
-        if (isPacked(new File(root, EXE)))
-            throw new Problem("This pop3.exe is still packed (as GOG installs it), and the game can't start from it. " + PACKED_STEPS);
         progress("Checking the game version...", 0, -1);
         String want = BuildConfig.EXE_SHA256;
         boolean known = want.isEmpty() || sha256(new File(root, EXE)).startsWith(want);
@@ -406,7 +377,7 @@ public class SetupActivity extends Activity {
         page();
         Ui.heading(mRoot, "A different version of the game");
         text("This pop3.exe isn't the version this app was made from, so the game will probably not start. "
-           + "The app needs the unpacked pop3.exe made by the build tool from the PC release (see the project page).",
+           + "The app needs the pop3.exe of the GOG release, as installed (packed) or unpacked with upx -d.",
              15, SOFT);
         button("Try it anyway", v -> after.run());
         button("Choose other files", v -> showWelcome());

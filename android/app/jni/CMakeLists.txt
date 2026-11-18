@@ -15,6 +15,11 @@ set(GEN "${RC_REPO}/out_all")
 if(NOT EXISTS "${GEN}/recomp_stubs.c")
   message(FATAL_ERROR "no generated code in ${GEN}: run android/build.ps1 (it translates the game first)")
 endif()
+# the packed (GOG) exe's UPX unpacker stub, translated by tools/upx_stub.py (android/build.ps1)
+set(UPX_SRC "${RC_REPO}/out_upx/upx_stub.c")
+if(NOT EXISTS "${UPX_SRC}")
+  message(FATAL_ERROR "no ${UPX_SRC}: run android/build.ps1")
+endif()
 
 add_subdirectory("${SDL2_SRC}" "${CMAKE_BINARY_DIR}/SDL2")
 
@@ -27,7 +32,7 @@ add_library(wgpu_native STATIC IMPORTED)
 set_target_properties(wgpu_native PROPERTIES IMPORTED_LOCATION "${WGPU}/lib/libwgpu_native.a")
 
 add_library(pop3 SHARED
-  ${GEN_SRC}
+  ${GEN_SRC} "${UPX_SRC}"
   "${RC_REPO}/runtime/runtime.c" "${RC_REPO}/runtime/interp.c"
   ${HOST_SRC}
   "${RC_REPO}/android/host/window_android.c" "${RC_REPO}/android/host/pop3_android_stubs.c")
@@ -48,7 +53,7 @@ target_compile_options(pop3 PRIVATE -frounding-math -w)
 target_compile_options(pop3 PRIVATE -fno-semantic-interposition)
 target_link_options(pop3 PRIVATE -Wl,-Bsymbolic)
 separate_arguments(RC_OPT_LIST UNIX_COMMAND "${RC_OPT}")
-set_source_files_properties(${GEN_SRC} "${RC_REPO}/runtime/runtime.c" "${RC_REPO}/runtime/interp.c"
+set_source_files_properties(${GEN_SRC} "${UPX_SRC}" "${RC_REPO}/runtime/runtime.c" "${RC_REPO}/runtime/interp.c"
                             PROPERTIES COMPILE_OPTIONS "${RC_OPT_LIST}")
 set_source_files_properties(${HOST_SRC} "${RC_REPO}/android/host/window_android.c" "${RC_REPO}/android/host/pop3_android_stubs.c"
                             PROPERTIES COMPILE_OPTIONS "-O2")

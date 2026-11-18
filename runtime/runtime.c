@@ -341,6 +341,13 @@ uint32_t add_dynamic_import(const char *name, GuestFn fn) {
 
 GuestFn find_import_handler(const char *name) { return find_handler(name); }
 
+/* The slot an import table entry gets: the host handler, or one that traps when called. Also used for a packed
+   exe, whose UPX stub fills the game's import table through GetProcAddress (host/kernel32.c). */
+uint32_t bind_import(const char *name) {
+    GuestFn fn = find_handler(name);
+    return add_dynamic_import(name, fn ? fn : unimplemented_import);
+}
+
 const char *import_name(uint32_t addr) {
     if (addr < IMPORT_BASE || addr >= IMPORT_BASE + g_nimports * 16) return NULL;
     return g_imports[(addr - IMPORT_BASE) / 16].name;
@@ -352,6 +359,7 @@ static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
 uint32_t g_image_lo, g_image_hi;
+int g_image_packed;   /* the exe has UPX sections (GOG's): host/main.c starts it at its unpacker stub */
 uint32_t g_state_lo, g_state_hi;
 
 int load_image(const char *path, LoadedImage *out) {
@@ -375,7 +383,9 @@ int load_image(const char *path, LoadedImage *out) {
 
     memcpy(HP(image_base), file, hdr_size);
     const uint8_t *sec = opt + optsz;
+    g_image_packed = 0;
     for (int i = 0; i < nsec; i++, sec += 40) {
+        if (!memcmp(sec, "UPX", 3)) g_image_packed = 1;   /* UPX0/UPX1: the game is compressed (GOG's exes) */
         uint32_t vsize = rd32(sec + 8), va = rd32(sec + 12), rawsz = rd32(sec + 16), rawptr = rd32(sec + 20);
         uint32_t n = rawsz < vsize ? rawsz : vsize;
         memset(HP(image_base + va), 0, vsize);
@@ -393,18 +403,13 @@ int load_image(const char *path, LoadedImage *out) {
         for (uint32_t k = 0;; k++) {
             uint32_t thunk = R32(image_base + ilt + 4 * k);
             if (!thunk) break;
-            ImportSlot *s = &g_imports[g_nimports];
+            char name[96];
             if (thunk & 0x80000000u)
-                snprintf(s->name, sizeof s->name, "%s!#%u", dll, thunk & 0xffff);
+                snprintf(name, sizeof name, "%s!#%u", dll, thunk & 0xffff);
             else
-                snprintf(s->name, sizeof s->name, "%s!%s", dll, (const char *)HP(image_base + thunk + 2));
-            for (char *p = s->name; *p && *p != '!'; p++) *p = (char)toupper((unsigned char)*p);
-            GuestFn fn = find_handler(s->name);
-            s->fn = fn ? fn : unimplemented_import;
-            uint32_t magic = IMPORT_BASE + g_nimports * 16;
-            W32(image_base + iat + 4 * k, magic);
-            register_function(magic, s->fn);
-            g_nimports++;
+                snprintf(name, sizeof name, "%s!%s", dll, (const char *)HP(image_base + thunk + 2));
+            for (char *p = name; *p && *p != '!'; p++) *p = (char)toupper((unsigned char)*p);
+            W32(image_base + iat + 4 * k, bind_import(name));
         }
     }
     free(file);
