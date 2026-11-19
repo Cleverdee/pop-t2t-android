@@ -270,7 +270,7 @@ static WGPUSampler g_samplers[4096];   /* indexed by sampler key: never evicted 
 static int g_ts_on, g_ts_capture;
 #define TS_MAX 64
 static uint32_t g_ts_n;
-static struct { uint32_t w, h, load, rt; } g_ts_info[TS_MAX];
+static struct { uint32_t w, h, load, rt, nd; } g_ts_info[TS_MAX];
 static WGPUQuerySet g_ts_set;
 static WGPUBuffer g_ts_resolve, g_ts_read;
 static int g_gpu_border;   /* WGPUNativeFeature_AddressModeClampToBorder: D3DTADDRESS_BORDER sampled as a border, not edge-clamped */
@@ -1028,10 +1028,10 @@ static WGPURenderPipeline make_pipeline(const PKey *k, WGPUShaderModule fm, WGPU
         pd.layout = g_pl_vs;
         pd.vertex.module = vm; pd.vertex.entryPoint = sv("vsp");
     }
-    pd.primitive.topology = (WGPUPrimitiveTopology)k->topo;
+    pd.primitive.topology = (WGPUPrimitiveTopology)(k->topo & 0xFF);
     pd.primitive.frontFace = WGPUFrontFace_CW;
     pd.primitive.cullMode = k->cull == 2 ? WGPUCullMode_Front : k->cull == 3 ? WGPUCullMode_Back : WGPUCullMode_None;
-    pd.depthStencil = &ds;
+    pd.depthStencil = (k->topo & 0x100) ? NULL : &ds;   /* 0x100: for passes without a depth buffer */
     pd.fragment = &fs;
     pd.multisample.count = 1; pd.multisample.mask = 0xFFFFFFFFu;
     return wgpuDeviceCreateRenderPipeline(g_dev, &pd);
@@ -1295,8 +1295,28 @@ static int g_tgt_depth_scratch;
 static uint32_t g_tgt_w, g_tgt_h, g_tgt_lw = 640, g_tgt_lh = 480;   /* GPU size and Direct3D size */
 static GSurf *g_tgt_gs;                                 /* NULL when drawing to the back buffer */
 
+/* Render passes open lazily (begin_pass only notes one as pending): the first draw decides whether the pass
+   needs the depth buffer. Post-processing (screen copies, glow, HUD) never tests depth, and loading and storing a
+   full-screen depth buffer for each such pass is about half of its memory traffic on a phone GPU. A pending pass
+   nothing is drawn in is skipped, unless it clears. */
+static struct { int on; uint32_t clear, color, stencil; float z; int scratch; } g_ppend;
+static int g_pass_nodepth;   /* the open pass has no depth attachment (its pipelines are made without depth) */
+static void open_pass(int with_depth);
 static void end_pass(void) {
+    if (!g_pass && g_ppend.on && (g_ppend.clear & 7)) open_pass(1);   /* a clear with nothing drawn after it */
+    g_ppend.on = 0;
     if (g_pass) { wgpuRenderPassEncoderEnd(g_pass); wgpuRenderPassEncoderRelease(g_pass); g_pass = NULL; }
+}
+/* the pass a draw goes into: opened now if pending, reopened with depth if the open one has none and the draw needs it */
+static void ensure_pass(int need_depth) {
+    if (g_pass && g_pass_nodepth && need_depth) {
+        wgpuRenderPassEncoderEnd(g_pass); wgpuRenderPassEncoderRelease(g_pass); g_pass = NULL;
+        g_ppend.on = 1; g_ppend.clear = 0; g_ppend.z = 1.f; g_ppend.color = g_ppend.stencil = 0; g_ppend.scratch = g_tgt_depth_scratch;
+    }
+    if (!g_pass) {
+        if (!g_ppend.on) { g_ppend.on = 1; g_ppend.clear = 0; g_ppend.z = 1.f; g_ppend.color = g_ppend.stencil = 0; g_ppend.scratch = g_tgt_depth_scratch; }
+        open_pass(need_depth || (g_ppend.clear & 6) || getenv("RC_ALWAYS_DEPTH"));
+    }
 }
 
 /* Textures the game freed. Releasing a WebGPU texture only drops a reference: its GPU memory goes when the
@@ -1356,7 +1376,7 @@ static WGPUCommandEncoder g_dxt_enc;
  * jobs in order (finish, buffer writes, DXT decodes, submit, retired textures), and a present job hands the frame
  * to the present thread. Anything else that touches the queue in an order-sensitive way first waits for it to
  * be idle (q_drain). At most a few jobs wait, so the game stays within a frame of the GPU work.
- * RC_ASYNC_SUBMIT=1 turns it on (off by default until it is tested on more phones). */
+ * On by default (Galaxy A17: heavy spots 40 -> 50 fps); RC_ASYNC_SUBMIT=0 turns it off. */
 typedef struct QJob {
     WGPUCommandEncoder enc, dxt;
     uint8_t *v, *u, *c;
@@ -1435,7 +1455,7 @@ static void q_drain(void) {
 static void *memdup_(const void *p, size_t n) { void *d = n ? malloc(n) : NULL; if (n) memcpy(d, p, n); return d; }
 static void q_start(void) {
     const char *e = getenv("RC_ASYNC_SUBMIT");
-    if (!e || !atoi(e)) return;   /* opt-in (RC_ASYNC_SUBMIT=1) until tested on more phones */
+    if (e && !atoi(e)) return;   /* RC_ASYNC_SUBMIT=0: submit on the game thread */
     pthread_t t;
     if (pthread_create(&t, NULL, qjob_thread, NULL)) return;
     pthread_detach(t);
@@ -1518,6 +1538,16 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     end_pass();
     if (g_scratch_clear && getenv("RC_SCRATCH_CLEAR")) { clear |= 2 | 4; z = 1.f; stencil = 0; }
     g_scratch_clear = 0;
+    g_ppend.on = 1; g_ppend.clear = clear; g_ppend.color = color; g_ppend.z = z; g_ppend.stencil = stencil;
+    g_ppend.scratch = g_tgt_depth_scratch;
+    if (getenv("RC_EAGER_PASSES")) open_pass(1);   /* debugging: the old way, every pass opened at once with depth */
+}
+
+/* opens the pending pass (g_pend) on the current target */
+static void open_pass(int with_depth) {
+    uint32_t clear = g_ppend.clear, color = g_ppend.color, stencil = g_ppend.stencil;
+    float z = g_ppend.z;
+    g_ppend.on = 0;
     if (!g_enc) g_enc = wgpuDeviceCreateCommandEncoder(g_dev, NULL);
     WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     ca.view = g_tgt_color ? g_tgt_color : g_bb_view;
@@ -1535,7 +1565,7 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     da.stencilClearValue = stencil;
     static int keep = -1;
     if (keep < 0) keep = getenv("RC_SCRATCH_KEEP") != NULL;
-    if (g_tgt_depth && g_tgt_depth_scratch == 1 && !keep) {   /* not 2: the game's own depth of another size, whose contents
+    if (g_tgt_depth && g_ppend.scratch == 1 && !keep) {   /* not 2: the game's own depth of another size, whose contents
                                                                     can carry over when a pass on that target is split */
         if (!(clear & 2)) da.depthClearValue = 1.f;
         if (!(clear & 4)) da.stencilClearValue = 0;
@@ -1544,13 +1574,15 @@ static void begin_pass(uint32_t clear, uint32_t color, float z, uint32_t stencil
     }
     WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
     rp.colorAttachmentCount = 1; rp.colorAttachments = &ca;
-    rp.depthStencilAttachment = &da;
+    rp.depthStencilAttachment = with_depth ? &da : NULL;
+    g_pass_nodepth = !with_depth;
     WGPUPassTimestampWrites tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
     if (g_ts_capture && g_ts_n < TS_MAX) {
         tw.querySet = g_ts_set; tw.beginningOfPassWriteIndex = 2 * g_ts_n; tw.endOfPassWriteIndex = 2 * g_ts_n + 1;
         rp.timestampWrites = &tw;
         g_ts_info[g_ts_n].w = g_tgt_w; g_ts_info[g_ts_n].h = g_tgt_h;
         g_ts_info[g_ts_n].load = !(clear & 1); g_ts_info[g_ts_n].rt = g_tgt_color && g_tgt_color != g_bb_view;
+        g_ts_info[g_ts_n].nd = !with_depth;
         g_ts_n++;
     }
     g_st.passes++;
@@ -1967,7 +1999,7 @@ static void exec_draw(const CmdDraw *c) {
         }
     }
     begin_frame();
-    if (!g_pass) begin_pass(0, 0, 1.f, 0);
+    if (!g_pass && !g_ppend.on) begin_pass(0, 0, 1.f, 0);
     /* vertex shader on the GPU: its constants, then its input registers per vertex (render_cmd.h) */
     const float *vs_consts = c->key.vs ? (const float *)(c + 1) : NULL;
     const void *verts = c->key.vs ? (const void *)(vs_consts + 96 * 4) : (const void *)(c + 1);
@@ -2033,7 +2065,9 @@ static void exec_draw(const CmdDraw *c) {
         victim->stamp = ++g_bg_stamp;
     }
 
+    ensure_pass(c->key.zen || (c->key.sten & 1));   /* (depth writes only happen with the depth test on) */
     PKey k = c->key;
+    if (g_pass_nodepth) k.topo |= 0x100;   /* a pipeline without depth, for a pass without it */
     if (!ps) k.ps = ff_tag(&c->u);   /* fixed function (or an untranslatable pixel shader): its own fragment shader */
     WGPURenderPipeline p = pipeline_for(&k);
     if (!p) return;   /* untranslatable vertex shader, or the cache is full */
@@ -2258,8 +2292,8 @@ static void ts_frame_done(void) {
             double ms = t[2 * i + 1] > t[2 * i] ? (double)(t[2 * i + 1] - t[2 * i]) * period : 0;
             total += ms;
             if (o < (int)sizeof line - 64)
-                o += snprintf(line + o, sizeof line - (size_t)o, " %ux%u%s%s %.2f", g_ts_info[i].w, g_ts_info[i].h,
-                              g_ts_info[i].rt ? "rt" : "bb", g_ts_info[i].load ? "L" : "C", ms);
+                o += snprintf(line + o, sizeof line - (size_t)o, " %ux%u%s%s%s %.2f", g_ts_info[i].w, g_ts_info[i].h,
+                              g_ts_info[i].rt ? "rt" : "bb", g_ts_info[i].load ? "L" : "C", g_ts_info[i].nd ? "-" : "", ms);
         }
         double span = t[2 * g_ts_n - 1] > t[0] ? (double)(t[2 * g_ts_n - 1] - t[0]) * period : 0;
         fprintf(stderr, "[gputime] %u passes, %.2f ms in passes, %.2f ms first to last:%s\n", g_ts_n, total, span, line);
@@ -2293,7 +2327,7 @@ void render_picture_rect(float r[4]) {
 static void exec_present(const CmdPresent *c) {
     begin_frame();
     use_backbuffer();
-    if (!g_pass && !g_enc) begin_pass(1, 0, 1.f, 0);   /* nothing drawn: present black */
+    if (!g_pass && !g_enc && !g_ppend.on) begin_pass(1, 0, 1.f, 0);   /* nothing drawn: present black */
     double t_sub = host_seconds();
     submit();
     g_st.submit_t += host_seconds() - t_sub;

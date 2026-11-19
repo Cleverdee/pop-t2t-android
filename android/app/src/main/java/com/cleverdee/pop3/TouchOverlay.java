@@ -213,6 +213,7 @@ public class TouchOverlay extends View {
 
     public TouchOverlay(Context context) {
         super(context);
+        setLayerType(LAYER_TYPE_HARDWARE, null);   /* drawn once into a texture, reused until invalidate() */
         mDp = context.getResources().getDisplayMetrics().density;
         mPrefs = context.getSharedPreferences("touch_layout", Context.MODE_PRIVATE);
         mClassic = mPrefs.getBoolean("classic", false);
@@ -457,13 +458,40 @@ public class TouchOverlay extends View {
         }
         send();
         /* redraw only when something drawn changed: camera drags redrawing every button 120 times a second cost
-           ~10% of the CPU (Android's RenderThread) that the game needs */
-        long sig = heldBits() * 1000003L + (mStickPointer < 0 ? -1 : ((int) mStickX >> 2) * 4099L + ((int) mStickY >> 2))
-                   + (mStickPointer < 0 ? 0 : ((long) mStickCx) << 40) + (mHidden ? 7 : 0);
+           ~10% of the CPU (Android's RenderThread) that the game needs, and the GPU time to re-render the layer */
+        long sig = heldBits() * 1000003L + (mStickPointer < 0 ? -1 : ((long) mStickCx) << 20 ^ (long) mStickCy) + (mHidden ? 7 : 0);
+        placeKnob();   /* the knob follows the finger without redrawing the buttons */
         if (sig != mDrawnSig || e.getActionMasked() != MotionEvent.ACTION_MOVE) { mDrawnSig = sig; invalidate(); }
         return true;
     }
     private long mDrawnSig;
+
+    /* The stick's knob: a small view of its own that slides with setTranslation, so moving the stick doesn't
+       re-render the overlay (a full-screen layer drawn by Android on the same GPU as the game). GameActivity adds
+       it above the overlay. */
+    private int mKnobColor;
+    private final View mKnob = new View(getContext()) {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        @Override protected void onDraw(Canvas c) {
+            p.setColor(mKnobColor);
+            c.drawCircle(getWidth() / 2f, getHeight() / 2f, getWidth() / 2f, p);
+        }
+    };
+    View knob() { return mKnob; }
+
+    private void placeKnob() {
+        boolean show = HAS_STICK[mLayout] && mStickPointer >= 0 && !mHidden && !mEdit && !mSettings && mStickRadius > 0;
+        if (!show) { if (mKnob.getVisibility() != GONE) mKnob.setVisibility(GONE); return; }
+        int size = Math.max(2, Math.round(mStickRadius * 0.9f));
+        android.view.ViewGroup.LayoutParams lp = mKnob.getLayoutParams();
+        if (lp != null && lp.width != size) { lp.width = lp.height = size; mKnob.setLayoutParams(lp); }
+        float dx = mStickX - mStickCx, dy = mStickY - mStickCy;
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len > mStickRadius) { dx *= mStickRadius / len; dy *= mStickRadius / len; }
+        mKnob.setTranslationX(mStickCx + dx - size / 2f);
+        mKnob.setTranslationY(mStickCy + dy - size / 2f);
+        if (mKnob.getVisibility() != VISIBLE) mKnob.setVisibility(VISIBLE);
+    }
 
     /* Direct touch on the game picture (menus, cut-scenes): the game's cursor only moves by relative mouse
        motion, so a touch first pushes it into the top-left corner, where the game stops it, then moves it by
@@ -774,6 +802,11 @@ public class TouchOverlay extends View {
 
     @Override
     protected void onDraw(Canvas c) {
+        drawOverlay(c);
+        placeKnob();
+    }
+
+    private void drawOverlay(Canvas c) {
         mText.setColor(Color.argb(200, 255, 255, 255));
         if (mFps >= 0) {
             mText.setTextAlign(Paint.Align.LEFT);
@@ -810,8 +843,8 @@ public class TouchOverlay extends View {
                 float dx = mStickX - mStickCx, dy = mStickY - mStickCy;
                 float len = (float) Math.sqrt(dx * dx + dy * dy);
                 if (len > mStickRadius) { dx *= mStickRadius / len; dy *= mStickRadius / len; }
-                mFill.setColor(Color.argb((int) (150 * a), 214, 170, 92));
-                c.drawCircle(mStickCx + dx, mStickCy + dy, mStickRadius * 0.45f, mFill);
+                int kc = Color.argb((int) (150 * a), 214, 170, 92);   /* the knob is its own view (mKnob) */
+                if (kc != mKnobColor) { mKnobColor = kc; mKnob.invalidate(); }
             } else {   /* where the stick lives: a faint ring at its resting place */
                 mLine.setColor(Color.argb((int) (110 * a), 214, 170, 92));
                 c.drawCircle(1.9f * mU, getHeight() - 1.9f * mU, mStickRadius * 0.8f, mLine);

@@ -215,9 +215,9 @@ static void video_size(uint32_t *w, uint32_t *h) {
     static unsigned sw, sh;
     if (!sw) {
         extern int android_screen_size(int *w, int *h);
-        /* the start screen's Resolution setting (GameActivity: Quality 540, Performance 432) or env.txt */
+        /* the start screen's Resolution setting (MenuActivity: 480p to the screen's height) or env.txt */
         const char *e = getenv("RC_RENDER_HEIGHT");
-        sh = e && atoi(e) >= 240 && atoi(e) <= 1080 ? (unsigned)atoi(e) & ~1u : 540;
+        sh = e && atoi(e) >= 240 && atoi(e) <= 2160 ? (unsigned)atoi(e) & ~1u : 540;
         int W = 0, H = 0;
         sw = android_screen_size(&W, &H) ? (unsigned)(((long long)sh * W / H + 1) & ~1LL) : sh * 16 / 9;
         if (sw < sh * 4 / 3) sw = sh * 4 / 3;       /* 4:3 at the narrowest */

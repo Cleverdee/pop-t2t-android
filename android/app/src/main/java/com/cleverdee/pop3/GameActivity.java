@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 
@@ -65,6 +66,8 @@ public class GameActivity extends SDLActivity implements InputManager.InputDevic
         mOverlay = new TouchOverlay(this);
         mLayout.addView(mOverlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                                                              ViewGroup.LayoutParams.MATCH_PARENT));
+        mLayout.addView(mOverlay.knob(), new ViewGroup.LayoutParams(2, 2));   /* the stick knob, above the overlay */
+        mOverlay.knob().setVisibility(View.GONE);
         mInput = (InputManager) getSystemService(Context.INPUT_SERVICE);
         mInput.registerInputDeviceListener(this, null);
         updateOverlay();

@@ -105,14 +105,17 @@ public class MenuActivity extends Activity {
         Ui.clear(mRoot);
         Ui.title(mRoot, "for Android");
         button("Play", v -> { startActivity(new Intent(this, GameActivity.class)); finish(); });
-        /* Resolution: Sharp renders 540 lines, Fast 432 (~36% fewer pixels: smoother with lots of effects) */
+        /* Resolution: the height the game renders at (the width follows the screen's shape); the display scales it
+           to the screen. Choices up to the screen's own height. */
         final android.content.SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        final int[] heights = resolutions();
         final Ui.MenuButton res = Ui.button(mRoot, "Resolution", true, null);
-        res.setNote(prefs.getInt("render_height", 540) == 540 ? "SHARP" : "FAST");
+        res.setNote(resolutionLabel(prefs.getInt("render_height", 540)));
         res.setOnClickListener(v -> {
-            int next = prefs.getInt("render_height", 540) == 540 ? 432 : 540;
+            int cur = prefs.getInt("render_height", 540), next = heights[0];
+            for (int k = 0; k < heights.length; k++) if (heights[k] == cur) { next = heights[(k + 1) % heights.length]; break; }
             prefs.edit().putInt("render_height", next).apply();
-            res.setNote(next == 540 ? "SHARP" : "FAST");
+            res.setNote(resolutionLabel(next));
         });
         if (!bundled())   /* add, replace or delete the player's own game files (SetupActivity) */
             Ui.button(mRoot, "Game files", true, v -> { startActivity(new Intent(this, SetupActivity.class).putExtra(SetupActivity.EXTRA_MANAGE, true)); finish(); });
@@ -144,6 +147,32 @@ public class MenuActivity extends Activity {
     private void showUpdateNote() {
         TextView t = Ui.text(mRoot, "Version " + sUpdate.version + " is available: tap Check for updates", 14, Ui.GOLD_LIGHT);
         t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+    }
+
+    /* ------------------------------------------------------------------ resolution */
+
+    private int[] screenSize() {   /* landscape: {long side, short side} in pixels */
+        android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(m);
+        return new int[] { Math.max(m.widthPixels, m.heightPixels), Math.min(m.widthPixels, m.heightPixels) };
+    }
+
+    private int[] resolutions() {
+        int[] all = { 480, 540, 720, 900, 1080, 1440 };
+        int screenH = screenSize()[1], n = 0;
+        for (int h : all) if (h <= screenH) n++;
+        if (n == 0) return new int[] { 540 };
+        int[] out = new int[n];
+        for (int k = 0; k < n; k++) out[k] = all[k];
+        return out;
+    }
+
+    /* "720p  1560x720", the width as the game picks it (host/core.c video_size: the screen's shape, 4:3 to 2.4:1) */
+    private String resolutionLabel(int h) {
+        int[] s = screenSize();
+        int w = (int) (((long) h * s[0] / s[1] + 1) & ~1L);
+        w = Math.max(w, h * 4 / 3); w = Math.min(w, h * 12 / 5); w &= ~1;
+        return h + "p  " + w + "x" + h;
     }
 
     private boolean bundled() {
