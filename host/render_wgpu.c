@@ -1577,6 +1577,31 @@ static GSurf *gsurf(uint32_t id, uint32_t w, uint32_t h, int depth) {
     return g;
 }
 
+/* A snapshot of a render target (or the back buffer) taken now, to sample while drawing into that same target.
+   Ends and restarts the render pass around the copy. One scratch texture per size, reused. */
+static WGPUTextureView target_copy(WGPUTexture src, uint32_t w, uint32_t h) {
+    static struct { uint32_t w, h; WGPUTexture t; WGPUTextureView v; } cache[6];
+    int slot = -1;
+    for (int i = 0; i < 6 && slot < 0; i++) if (cache[i].t && cache[i].w == w && cache[i].h == h) slot = i;
+    for (int i = 0; i < 6 && slot < 0; i++) if (!cache[i].t) slot = i;
+    if (slot < 0) { slot = 0; release_view(cache[0].v); wgpuTextureRelease(cache[0].t); cache[0].t = NULL; }
+    if (!cache[slot].t) {
+        WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        td.size = (WGPUExtent3D){ w, h, 1 }; td.format = g_surf_fmt;
+        td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        cache[slot].t = wgpuDeviceCreateTexture(g_dev, &td);
+        cache[slot].v = wgpuTextureCreateView(cache[slot].t, NULL);
+        cache[slot].w = w; cache[slot].h = h;
+    }
+    end_pass();
+    WGPUTexelCopyTextureInfo cs = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, cd = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    cs.texture = src; cd.texture = cache[slot].t;
+    WGPUExtent3D ex = { w, h, 1 };
+    wgpuCommandEncoderCopyTextureToTexture(g_enc, &cs, &cd, &ex);
+    begin_pass(0, 0, 1.f, 0);
+    return cache[slot].v;
+}
+
 /* depth buffer for targets whose depth surface doesn't match their size (WebGPU needs equal sizes) */
 static WGPUTextureView scratch_depth(uint32_t w, uint32_t h) {
     static struct { uint32_t w, h; WGPUTexture t; WGPUTextureView v; } cache[8];
@@ -1968,30 +1993,14 @@ static void exec_draw(const CmdDraw *c) {
             GTex *g = obj_get(c->slot_id[s]);
             if (g) { g->used_in_batch = g_batch; views[s] = g->view; }
         } else if (c->slot_kind[s] == TS_BACKBUF) {
-            /* the back buffer is sampled (through a copy of it) only while drawing into something else */
-            if (g_tgt_color && g_tgt_color != g_bb_view) {
-                static WGPUTexture copy; static WGPUTextureView copy_view; static uint32_t cw, ch;
-                if (!copy || cw != (uint32_t)g_surf_w || ch != (uint32_t)g_surf_h) {
-                    if (copy) { release_view(copy_view); wgpuTextureRelease(copy); }
-                    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
-                    cw = (uint32_t)g_surf_w; ch = (uint32_t)g_surf_h;
-                    td.size = (WGPUExtent3D){ cw, ch, 1 }; td.format = g_surf_fmt;
-                    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-                    copy = wgpuDeviceCreateTexture(g_dev, &td);
-                    copy_view = wgpuTextureCreateView(copy, NULL);
-                }
-                end_pass();
-                WGPUTexelCopyTextureInfo cs = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, cd = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-                cs.texture = g_bb; cd.texture = copy;
-                WGPUExtent3D cex = { cw, ch, 1 };
-                wgpuCommandEncoderCopyTextureToTexture(g_enc, &cs, &cd, &cex);
-                begin_pass(0, 0, 1.f, 0);
-                views[s] = copy_view;
-            } else views[s] = g_black.view;
+            /* sampled through a copy: Direct3D allows drawing into the texture being read (the hit effect draws
+               the picture onto itself), WebGPU doesn't */
+            views[s] = g_tgt_color ? target_copy(g_bb, (uint32_t)g_surf_w, (uint32_t)g_surf_h) : g_black.view;
         } else if (c->slot_kind[s] == TS_RTSURF) {
             GSurf *gs = obj_get(c->slot_id[s]);
-            /* a render-target texture is never sampled while it is being drawn into */
-            views[s] = gs && !gs->depth && gs->view != g_tgt_color ? gs->view : g_black.view;
+            if (!gs || gs->depth) views[s] = g_black.view;
+            else if (gs->view == g_tgt_color) views[s] = target_copy(gs->tex, gs->w, gs->h);   /* reads its own target */
+            else views[s] = gs->view;
         }
     }
     memcpy(g_vstage + g_vpos, verts, bytes + ibytes);

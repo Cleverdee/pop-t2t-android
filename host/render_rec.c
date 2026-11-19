@@ -89,6 +89,7 @@ static void cmd_flush(int ends_frame) { (void)ends_frame; }
 #include <fcntl.h>
 #include <unistd.h>
 static int g_snap_detail, g_snap_saved_fd = -1;
+static int g_autosnap_req, g_snap_auto;   /* see novel_state() */
 static float g_cam_c[12][4], g_cam_last[12][4];   /* c4-c7 of the frame's first shader draw (this frame / the last whole frame) */
 static int g_cam_seen;
 /* the camera's view-projection rows as the game passed them (c4..c7); 0 if none yet */
@@ -98,6 +99,31 @@ extern char g_game_root[4096];
 double g_prof_draw, g_prof_present; uint64_t g_prof_verts, g_prof_draws_vs;   /* seconds spent recording draws / presenting (RC_LOG_FPS prints them per frame) */
 static uint32_t g_trace_vs;
 
+/* RC_AUTOSNAP=1 (debugging): log every draw state (shaders, blending, render target) the first time it is used, and
+   after warm-up ask for a detailed log of the next frame (snap_auto_<frame>.txt), at most once every 2 seconds: catches
+   short effects such as the hit flash without having to time a snapshot. */
+static void novel_state(const Device *d) {
+    const DevState *st = &d->st;
+    if (!env_flag("RC_AUTOSNAP")) return;
+    static uint64_t *set; static uint32_t cap, used, last_req;
+    uint32_t g_frame_no = d->frame;
+    uint64_t k = ((uint64_t)st->ps * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)st->vs << 20) ^ ((uint64_t)st->rs[19] << 1) ^ ((uint64_t)st->rs[20] << 7)
+               ^ ((uint64_t)st->rs[171] << 13) ^ ((uint64_t)(st->rs[27] != 0) << 17) ^ ((uint64_t)st->render_target << 40)
+               ^ ((uint64_t)st->tss[0][1] << 50) ^ ((uint64_t)st->rs[15] << 56);
+    k |= 1;
+    if (used * 2 >= cap) {
+        uint32_t nc = cap ? cap * 2 : 4096; uint64_t *ns = calloc(nc, 8);
+        for (uint32_t i = 0; i < cap; i++) if (set[i]) { uint32_t h = (uint32_t)(set[i] >> 3) & (nc - 1); while (ns[h]) h = (h + 1) & (nc - 1); ns[h] = set[i]; }
+        free(set); set = ns; cap = nc;
+    }
+    uint32_t h = (uint32_t)(k >> 3) & (cap - 1);
+    while (set[h]) { if (set[h] == k) return; h = (h + 1) & (cap - 1); }
+    set[h] = k; used++;
+    fprintf(stderr, "[novel] frame %u draw %u: ps %x vs %x blend %u/%u op %u ab %d at %d rt %x tex0 %x op0 %u\n", g_frame_no, g_f_drawn - 1,
+            st->ps, st->vs, st->rs[19], st->rs[20], st->rs[171], st->rs[27] != 0, st->rs[15] != 0, st->render_target, st->texture[0], st->tss[0][1]);
+    if (g_frame_no > 600 && g_frame_no - last_req > 120) { last_req = g_frame_no; g_autosnap_req = 1; }
+}
+
 static int want_screenshot(uint32_t frame) {
     static uint32_t last_check;
     static int cap_frame = -1;
@@ -106,6 +132,15 @@ static int want_screenshot(uint32_t frame) {
         g_trace_vs = getenv("RC_TRACE_VS") ? (uint32_t)strtoul(getenv("RC_TRACE_VS"), NULL, 16) : 0;
     }
     if (cap_frame && frame + 1 == (uint32_t)cap_frame) { g_snap_detail = 1; return 0; }
+    if (g_autosnap_req && !g_snap_detail) {   /* RC_AUTOSNAP: a draw state never seen before showed up: log the next frame in detail */
+        g_autosnap_req = 0;
+        char ap[4200];
+        snprintf(ap, sizeof ap, "%s/../snap_auto_%u.txt", g_game_root, frame + 1);
+        int fd = open(ap, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { fflush(stderr); g_snap_saved_fd = dup(2); dup2(fd, 2); close(fd); }
+        g_snap_detail = 1; g_snap_auto = 1;
+        return 0;
+    }
     if (frame - last_check >= 15) {
         last_check = frame;
         char snap_p[4200];   /* debugging: <game>/../snap.txt (Android: files/snap.txt) asks for a detailed frame */
@@ -121,7 +156,7 @@ static int want_screenshot(uint32_t frame) {
         }
     }
     if (g_snap_detail) {
-        g_snap_detail = 0;
+        g_snap_detail = 0; g_snap_auto = 0;
         fprintf(stderr, "[snap] frame %u: %u draws\n", frame, g_f_drawn);
         if (g_snap_saved_fd >= 0) { fflush(stderr); dup2(g_snap_saved_fd, 2); close(g_snap_saved_fd); g_snap_saved_fd = -1; }
         return 1;
@@ -735,7 +770,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
     c->nidx = nidx;
     c->vs_stride = gpu_in >= 0 ? vs_stride : 0;
     c->vb_id = vb_id;
-    c->capture_index = g_snap_detail ? (int32_t)(g_f_drawn - 1) : -1;
+    c->capture_index = g_snap_detail && !g_snap_auto ? (int32_t)(g_f_drawn - 1) : -1;   /* automatic logs: text only */
     if (vb_id) {
         float *consts = (float *)(c + 1);
         if (sh) vs_constants(sh, (const float (*)[4])st->vs_const, (float (*)[4])consts);
@@ -893,6 +928,7 @@ static void rec_draw_impl(Device *d, uint32_t prim, uint32_t prim_count, uint32_
         }
     }
     memcpy(u->psc, st->ps_const, sizeof u->psc);
+    novel_state(d);
     if (g_snap_detail && st->ps) fprintf(stderr, "[psc] draw %u ps %x c0=(%g,%g,%g,%g) c1=(%g,%g,%g,%g) rt %x tex0 %x tex1 %x\n", g_f_drawn - 1, st->ps,
         st->ps_const[0][0], st->ps_const[0][1], st->ps_const[0][2], st->ps_const[0][3], st->ps_const[1][0], st->ps_const[1][1], st->ps_const[1][2], st->ps_const[1][3],
         st->render_target, st->texture[0], st->texture[1]);
