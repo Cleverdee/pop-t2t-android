@@ -167,13 +167,7 @@ public class MenuActivity extends Activity {
         return out;
     }
 
-    /* "720p  1560x720", the width as the game picks it (host/core.c video_size: the screen's shape, 4:3 to 2.4:1) */
-    private String resolutionLabel(int h) {
-        int[] s = screenSize();
-        int w = (int) (((long) h * s[0] / s[1] + 1) & ~1L);
-        w = Math.max(w, h * 4 / 3); w = Math.min(w, h * 12 / 5); w &= ~1;
-        return h + "p  " + w + "x" + h;
-    }
+    private String resolutionLabel(int h) { return h + "p"; }
 
     private boolean bundled() {
         try (InputStream in = getAssets().open("game_manifest.txt")) { return true; } catch (IOException e) { return false; }
