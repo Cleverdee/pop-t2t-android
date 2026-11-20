@@ -136,6 +136,13 @@ static void pin_to_fast_cores(void) {
     }
     unsigned long long set = 0;
     for (int i = 0; i < 64; i++) if (best && f[i] == best) { set |= 1ull << i; n++; }
+    if (n == 1) {   /* one prime core (Snapdragon 8xx: X1 + 3 big): the game's other threads (renderer, sound loader)
+                       inherit this set, and on one core they all queued behind the game thread. Add the next tier. */
+        unsigned next = 0;
+        for (int i = 0; i < 64; i++) if (f[i] < best && f[i] > next) next = f[i];
+        if (next >= best * 3 / 4)
+            for (int i = 0; i < 64; i++) if (f[i] == next) { set |= 1ull << i; n++; }
+    }
     if (!n) return;
     int r = (int)syscall(__NR_sched_setaffinity, 0, sizeof set, &set);
     fprintf(stderr, "[main] game thread on the %d fastest cores (%u kHz): %s\n", n, best, r ? "failed" : "ok");
@@ -220,6 +227,17 @@ int main(int argc, char **argv) {
 #endif
             return 1;
         }
+    } else if (!lookup_function(g_img.entry)) {
+        /* another release of the game (retail, Steam, Ubisoft): its code isn't in this build. Say so instead of
+           exiting from the game thread later (which crashed in Android's UI thread on a destroyed mutex). */
+        static char why[300];
+        snprintf(why, sizeof why, "This %s is a different version of the game from the one this app supports (it "
+                 "starts at %08x). Please use the GOG version of the game.", PROFILE_EXE, g_img.entry);
+        fprintf(stderr, "entry point %08x was not recompiled\n%s\n", g_img.entry, why);
+#ifdef __ANDROID__
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, PROFILE_TITLE, why, NULL);
+#endif
+        return 1;
     }
 
     /* The window and its event loop must live on the main thread (macOS); the game gets its own

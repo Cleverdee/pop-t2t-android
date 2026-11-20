@@ -1,3 +1,4 @@
+#include <string.h>
 /* The host window (SDL2) and input: runs on the process's main thread, as macOS requires.
  * Keyboard events become DirectInput scan codes (g_dik), Windows virtual-key state (g_keys) and
  * WM_KEYDOWN/WM_KEYUP messages for the game's window procedure. */
@@ -86,8 +87,27 @@ static int pad_slot_of(SDL_JoystickID id) {
         if (g_joy[i] && SDL_JoystickInstanceID(g_joy[i]) == id) return i;
     return -1;
 }
+/* Phones list sensors as joysticks too: Xiaomi's fingerprint reader is "uinput-fpc" (others: uinput-goodix,
+   uinput-silead...), with 1 axis. Taken as pad 0 it held the camera turning and hid the touch stick from the game.
+   A real pad has at least two axes (a stick) and isn't a uinput sensor. */
+static int pad_ignored(int device_index) {
+    const char *n = SDL_JoystickNameForIndex(device_index);
+    char low[128] = { 0 };
+    for (int k = 0; n && n[k] && k < 127; k++) low[k] = (char)(n[k] >= 'A' && n[k] <= 'Z' ? n[k] + 32 : n[k]);
+    if (strncmp(low, "uinput", 6) == 0 || strstr(low, "fingerprint") || strstr(low, "fpc") || strstr(low, "goodix"))
+        return 1;
+    SDL_Joystick *j = SDL_JoystickOpen(device_index);
+    if (!j) return 0;
+    int axes = SDL_JoystickNumAxes(j);
+    SDL_JoystickClose(j);
+    return axes < 2;
+}
 static void pad_added(int device_index) {
     if (pad_slot_of(SDL_JoystickGetDeviceInstanceID(device_index)) >= 0) return;   /* already open */
+    if (pad_ignored(device_index)) {
+        fprintf(stderr, "controller ignored: %s (not a gamepad)\n", SDL_JoystickNameForIndex(device_index));
+        return;
+    }
     for (int i = 0; i < PAD_SLOTS; i++)
         if (!g_joy[i]) {
             if (SDL_IsGameController(device_index)) {

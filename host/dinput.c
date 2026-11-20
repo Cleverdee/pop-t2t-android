@@ -340,7 +340,10 @@ static int yaw_matrix_write(double yaw, double target) {
 static int yaw_follow(double rx, int *ux) {
     if (g_yf_on < 0) {
         const char *e = getenv("RC_CAMF");
-        g_yf_on = !(e && !strcmp(e, "off"));
+        /* off by default: the follow loop (heading feedback) was tuned to one phone's frame rate and lag, and on others
+           (a Snapdragon 888 at ~35 fps) it overshot, so a tap set the camera swinging left and right for a second and
+           play drifted. Left/right now uses the rate band like up/down; RC_CAMF=on (or gains) turns following back on. */
+        g_yf_on = e && strcmp(e, "off") != 0;
         if (e && g_yf_on) sscanf(e, "%f,%f,%f", &g_camf[0], &g_camf[1], &g_camf[2]);
     }
     yf_poll();

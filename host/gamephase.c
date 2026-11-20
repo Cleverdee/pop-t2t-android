@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /* Game phase for the Android touch overlay (android/.../TouchOverlay.java picks its layout from it):
  *   2 cut-scene   a Bink movie is open (logos, loading screens, cinematics)
  *   1 menu        the game's open UI pages are all menu pages (ui_menu below)
@@ -48,7 +49,20 @@ static void seek_step(void) {
         g_last_cx = g_cx; g_last_cy = g_cy;
         if (!still ? --g_settle > 0 : --g_settle > 4) return;
     }
-    input_mouse_move((int)lroundf(ex * 0.8f), (int)lroundf(ey * 0.8f));   /* ~1 mouse count per pixel; undershoot */
+    /* pixels per mouse count depend on the render size and the game's mouse speed (about 1 at 540p, more above), so
+       a fixed gain overshot and swung back and forth at 720p: measure it from the last move and aim at 0.8 of the way */
+    static float ratio = 1.f;
+    static int sent_x, sent_y;
+    static float from_x, from_y;
+    if (g_seek_frames > 1 && (abs(sent_x) >= 4 || abs(sent_y) >= 4)) {
+        float moved = sqrtf((g_cx - from_x) * (g_cx - from_x) + (g_cy - from_y) * (g_cy - from_y));
+        float sent = sqrtf((float)(sent_x * sent_x + sent_y * sent_y));
+        float r = moved / sent;
+        if (r > 0.2f && r < 8.f) ratio = r;
+    }
+    sent_x = (int)lroundf(ex * 0.8f / ratio); sent_y = (int)lroundf(ey * 0.8f / ratio);
+    from_x = g_cx; from_y = g_cy;
+    input_mouse_move(sent_x, sent_y);
     g_settle = 8;
     g_last_cx = g_cx; g_last_cy = g_cy;
 }

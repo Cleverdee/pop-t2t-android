@@ -35,6 +35,7 @@ typedef struct SBuf {
     int is3d;                     /* DSBCAPS_CTRL3D and not DS3DMODE_DISABLE */
     uint32_t mode3d;              /* DS3DMODE_NORMAL 0, HEADRELATIVE 1, DISABLE 2 */
     float pos3[3], mind, maxd;    /* 3D position and distance range */
+    uint32_t id;                  /* creation order, for RC_LOG_DSOUND */
     struct SBuf *next;
 } SBuf;
 
@@ -243,9 +244,28 @@ static void hs_mix(HStream *s, float *mix, int frames) {
     }
 }
 
+/* RC_LOG_DSOUND=1: every 2 s, each playing buffer's settings, the gain the mixer applies and the loudest sample in it */
+static void trace_playing(int frames) {
+    static uint64_t acc;
+    if ((acc += (uint64_t)frames) < 2 * MIX_RATE) return;
+    acc = 0;
+    LOG("[dstrace] listener pos %.2f %.2f %.2f rolloff %.2f distfactor %.3f\n", g_lpos[0], g_lpos[1], g_lpos[2], g_rolloff, g_distfactor);
+    for (SBuf *b = g_bufs; b; b = b->next) {
+        if (!b->playing || b->primary || !b->mem) continue;
+        int peak = 0;
+        uint32_t n = b->size > 16384 ? 16384 : b->size;   /* (under the mixer lock: keep it short) */
+        if (b->bits == 16) for (uint32_t i = 0; i + 1 < n; i += 2) { int v = abs((int16_t)R16(b->mem + i)); if (v > peak) peak = v; }
+        float sg, sp; spatial(b, &sg, &sp);
+        LOG("[dstrace] play #%u %u B %u/%u Hz %u ch flags %x vol %d pan %d loop %d 3d %d mode %u pos %.2f %.2f %.2f min %.2f max %.2f -> gain3d %.3f g %.3f/%.3f peak %d notify %u\n",
+            b->id, b->size, b->freq, b->rate, b->channels, b->flags, b->volume, b->pan, b->looping, b->is3d, b->mode3d,
+            b->pos3[0], b->pos3[1], b->pos3[2], b->mind, b->maxd, sg, b->gl_cur, b->gr_cur, peak, b->notify_n);
+    }
+}
+
 static void mix_frames(float *out, int frames) {
     memset(out, 0, sizeof(float) * 2 * (size_t)frames);
     pthread_mutex_lock(&g_snd_lock);
+    if (env_flag("RC_LOG_DSOUND")) trace_playing(frames);
     for (SBuf *b = g_bufs; b; b = b->next) advance(b, out, frames);
     for (int i = 0; i < HS_MAX; i++) hs_mix(&g_hs[i], out, frames);
     pthread_mutex_unlock(&g_snd_lock);
@@ -332,7 +352,17 @@ static int open_aaudio(void) {
     }
     /* a few bursts of cushion: the game thread is busy and the mixer shares the guest lock */
     int32_t burst = AAudioStream_getFramesPerBurst(s);
-    if (burst > 0) AAudioStream_setBufferSizeInFrames(s, burst * 4);
+    /* at least ~40 ms: Snapdragon phones report small bursts (2-4 ms), and 4 of them crackled while the game thread
+       held the mixer up */
+    if (burst > 0) {
+        int32_t want = burst * 4, min = MIX_RATE / 25;
+        if (want < min) want = (min + burst - 1) / burst * burst;
+        AAudioStream_setBufferSizeInFrames(s, want);
+    }
+    fprintf(stderr, "[dsound] AAudio: %d Hz %d ch, burst %d, buffer %d of %d frames, perf mode %d, sharing %d, device %d\n",
+            AAudioStream_getSampleRate(s), AAudioStream_getChannelCount(s), burst, AAudioStream_getBufferSizeInFrames(s),
+            AAudioStream_getBufferCapacityInFrames(s), (int)AAudioStream_getPerformanceMode(s),
+            (int)AAudioStream_getSharingMode(s), AAudioStream_getDeviceId(s));
     g_aa_lost = 0;
     if ((r = AAudioStream_requestStart(s)) != AAUDIO_OK) {
         fprintf(stderr, "[dsound] AAudio start: %s\n", AAudio_convertResultToText(r));
@@ -540,6 +570,7 @@ W(b_Lock) {
 W(b_Play) {
     SBuf *b = buf(c);
     start_mixer();
+    { static unsigned n; if (env_flag("RC_LOG_DSOUND") && !b->playing && n++ < 3000) LOG("[dstrace] Play #%u (%u B, %u Hz, %u ch, flags %x, vol %d, loop %u)\n", b->id, b->size, b->freq, b->channels, b->flags, b->volume, ARG(3) & 1); }
     pthread_mutex_lock(&g_snd_lock);
     if (!b->playing) { b->gl_cur = b->gr_cur = 0.f; b->fade = 0; }
     b->playing = 1;
@@ -561,7 +592,11 @@ W(b_SetFormat) {
     if (b->primary) { b->channels = R16(p + 2); b->rate = R32(p + 4); b->bits = R16(p + 14); }
     RET(2, S_OK);
 }
-W(b_SetVolume) { buf(c)->volume = (int32_t)ARG(1); RET(2, S_OK); }
+W(b_SetVolume) {
+    SBuf *b = buf(c);
+    { static unsigned n; if (env_flag("RC_LOG_DSOUND") && b->size > 60000 && (int32_t)ARG(1) != b->volume && n++ < 2000) LOG("[dstrace] SetVolume #%u %d -> %d\n", b->id, b->volume, (int32_t)ARG(1)); }
+    b->volume = (int32_t)ARG(1); RET(2, S_OK);
+}
 W(b_SetPan) { buf(c)->pan = (int32_t)ARG(1); RET(2, S_OK); }
 W(b_SetFrequency) { SBuf *b = buf(c); b->freq = ARG(1) ? ARG(1) : b->rate; RET(2, S_OK); }
 W(b_Stop) { SBuf *b = buf(c); pthread_mutex_lock(&g_snd_lock); if (b->playing) b->fade = FADE_FRAMES; b->playing = 0; pthread_mutex_unlock(&g_snd_lock); RET(1, S_OK); }
@@ -651,19 +686,21 @@ static uint32_t new_buffer(uint32_t desc) {
     if (wfx) { b->channels = R16(wfx + 2); b->rate = R32(wfx + 4); b->bits = R16(wfx + 14); }
     b->freq = b->rate;
     b->is3d = !b->primary && (b->flags & 0x10) != 0; b->mind = 1.f; b->maxd = 1e9f;
+    { static uint32_t next_id; b->id = next_id++; }
     if (!b->primary && b->size) b->mem = heap_alloc(b->size + 16, 1);
     pthread_mutex_lock(&g_snd_lock);
     b->next = g_bufs;
     g_bufs = b;
     pthread_mutex_unlock(&g_snd_lock);
-    LOG("[dsound] CreateSoundBuffer: %s %u bytes, %u Hz %u ch %u bit, flags %x\n", b->primary ? "primary" : "secondary",
-        b->size, b->rate, b->channels, b->bits, b->flags);
+    LOG("[dsound] CreateSoundBuffer #%u: %s %u bytes, %u Hz %u ch %u bit, flags %x\n", b->id,
+        b->primary ? "primary" : "secondary", b->size, b->rate, b->channels, b->bits, b->flags);
     return com_new(&IDirectSoundBuffer_i, 0, b);
 }
 
 W(ds_CreateSoundBuffer) { W32(ARG(2), new_buffer(ARG(1))); RET(4, S_OK); }
 W(ds_GetCaps) {
     uint32_t p = ARG(1), sz = R32(p);
+    LOG("[dsound] GetCaps (size %u)\n", sz);
     memset(HP(p + 4), 0, sz > 4 ? sz - 4 : 0);
     W32(p + 4, 0x0F5F);         /* DSCAPS: primary/secondary mono/stereo 8/16 bit, continuous rate, certified */
     W32(p + 8, 100); W32(p + 12, 100000);
@@ -676,6 +713,8 @@ W(ds_DuplicateSoundBuffer) {
     SBuf *b = calloc(1, sizeof *b);
     *b = *src;
     b->playing = 0; b->pos = 0; b->notify_n = 0;
+    { static uint32_t dup_id = 100000; b->id = dup_id++; }
+    if (env_flag("RC_LOG_DSOUND")) LOG("[dstrace] Duplicate #%u -> #%u\n", src->id, b->id);
     pthread_mutex_lock(&g_snd_lock);
     b->next = g_bufs; g_bufs = b;
     pthread_mutex_unlock(&g_snd_lock);
