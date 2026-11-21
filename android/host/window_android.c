@@ -385,9 +385,21 @@ static const int g_std_for_raw[12] = { 2, 0, 1, 3, 4, 5, 6, 7, 9, 8, 10, 11 };
 static volatile uint32_t g_touch_buttons;
 static volatile int g_touch_lx, g_touch_ly;
 
+/* While the on-screen controls are in use they own pad 0, even with a "controller" connected: some phones list
+   built-in parts as controllers that get past the filters in pad_added, and the touch stick then never reached
+   the game (the Prince wouldn't walk; key buttons like Jump still worked). A real pad gets pad 0 back as soon
+   as the screen is let go. */
+static int g_touch_active;
+static void pad_report(int slot);
 static void touch_report(void) {
-    if (g_joy[0]) return;   /* a physical controller has pad 0 */
-    input_gamepad(0, 1, g_touch_buttons | g_touch_esc, g_touch_lx, g_touch_ly, 0, 0);
+    uint32_t b = g_touch_buttons | g_touch_esc;
+    int active = b || g_touch_lx || g_touch_ly;
+    if (g_joy[0] && !active) {
+        if (g_touch_active) { g_touch_active = 0; pad_report(0); }   /* back to the physical pad */
+        return;
+    }
+    g_touch_active = active;
+    input_gamepad(0, 1, b, g_touch_lx, g_touch_ly, 0, 0);
 }
 
 JNIEXPORT void JNICALL Java_com_cleverdee_pop3_TouchOverlay_nativeTouchPad(JNIEnv *env, jclass cls,
@@ -441,6 +453,7 @@ JNIEXPORT void JNICALL Java_com_cleverdee_pop3_TouchOverlay_nativeTouchMouse(JNI
 static void pad_report(int slot) {
     SDL_GameController *gc = g_pad[slot];
     SDL_Joystick *js = g_joy[slot];
+    if (slot == 0 && js && g_touch_active) return;   /* the screen is in use: touch_report owns pad 0 */
     if (!js) {
         if (slot == 0) { g_touch_dirty = 1; return; }   /* pad 0 goes back to the touch overlay */
         input_gamepad(slot, 0, 0, 0, 0, 0, 0);

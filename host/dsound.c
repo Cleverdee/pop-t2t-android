@@ -318,11 +318,32 @@ static AAudioStream *g_aa;
 static volatile int g_aa_lost;        /* error callback: disconnected */
 static volatile int g_fg = 1;         /* GameActivity is resumed */
 
+/* The stream's callback only copies from a ring that the supervisor thread keeps ~60 ms ahead. Mixing inside the
+   callback (as before) took g_snd_lock, which the game's sound calls hold, plus the event locks of buffer
+   notifications: whenever one was busy the callback came back late and the speaker underran (crackle on many
+   phones, depending on chip and timing). The callback now never locks or mixes. */
+#define AR_FRAMES 16384u                    /* ~370 ms */
+static float g_ar[AR_FRAMES * 2];
+static volatile uint32_t g_ar_w, g_ar_r;    /* frames written (supervisor) and read (callback) */
+static uint32_t g_ar_target = MIX_RATE * 60 / 1000;
+static volatile uint32_t g_ar_under;        /* callbacks that found the ring short */
+
 static aaudio_data_callback_result_t aa_data(AAudioStream *s, void *ud, void *audio, int32_t frames) {
     (void)ud;
-    mix_frames((float *)audio, frames);
+    float *out = (float *)audio;
+    uint32_t r = g_ar_r, w = __atomic_load_n(&g_ar_w, __ATOMIC_ACQUIRE);
+    uint32_t avail = w - r, n = (uint32_t)frames < avail ? (uint32_t)frames : avail;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = (r + i) % AR_FRAMES;
+        out[2 * i] = g_ar[2 * k]; out[2 * i + 1] = g_ar[2 * k + 1];
+    }
+    if (n < (uint32_t)frames) {
+        memset(out + 2 * n, 0, sizeof(float) * 2 * (size_t)((uint32_t)frames - n));
+        g_ar_under++;
+    }
+    __atomic_store_n(&g_ar_r, r + n, __ATOMIC_RELEASE);
     int32_t q = AAudioStream_getBufferSizeInFrames(s);   /* queued ahead of the speakers, for GetCurrentPosition */
-    g_out_latency = q > 0 ? (uint32_t)q : (uint32_t)frames;
+    g_out_latency = (q > 0 ? (uint32_t)q : (uint32_t)frames) + (avail - n);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 static void aa_error(AAudioStream *s, void *ud, aaudio_result_t err) {
@@ -364,6 +385,13 @@ static int open_aaudio(void) {
             AAudioStream_getBufferCapacityInFrames(s), (int)AAudioStream_getPerformanceMode(s),
             (int)AAudioStream_getSharingMode(s), AAudioStream_getDeviceId(s));
     g_aa_lost = 0;
+    {   /* ring: at least 60 ms and two callbacks' worth ahead; starts empty (the callback is not running yet) */
+        uint32_t t2 = burst > 0 ? 2u * (uint32_t)burst : 0;
+        g_ar_target = MIX_RATE * 60 / 1000;
+        if (t2 > g_ar_target) g_ar_target = t2;
+        if (g_ar_target > AR_FRAMES / 2) g_ar_target = AR_FRAMES / 2;
+        __atomic_store_n(&g_ar_r, g_ar_w, __ATOMIC_RELEASE);
+    }
     if ((r = AAudioStream_requestStart(s)) != AAUDIO_OK) {
         fprintf(stderr, "[dsound] AAudio start: %s\n", AAudio_convertResultToText(r));
         AAudioStream_close(s);
@@ -395,7 +423,25 @@ static void *audio_supervisor(void *arg) {
             if (open_aaudio()) fprintf(stderr, "[dsound] audio output %s\n", opened_before++ ? "reopened" : "started (AAudio)");
             else retry_at = host_seconds() + 1.0;
         }
-        if (g_aa) { usleep(50000); next = host_seconds(); continue; }   /* the stream's callback mixes */
+        if (g_aa) {   /* keep the callback's ring topped up (paced by the audio clock that drains it) */
+            uint32_t fill = __atomic_load_n(&g_ar_w, __ATOMIC_ACQUIRE) - __atomic_load_n(&g_ar_r, __ATOMIC_ACQUIRE);
+            if (fill < g_ar_target) {
+                mix_frames(tmp, 441);
+                uint32_t w = g_ar_w;
+                for (int i = 0; i < 441; i++) {
+                    uint32_t k = (w + (uint32_t)i) % AR_FRAMES;
+                    g_ar[2 * k] = tmp[2 * i]; g_ar[2 * k + 1] = tmp[2 * i + 1];
+                }
+                __atomic_store_n(&g_ar_w, w + 441, __ATOMIC_RELEASE);
+            } else usleep(2000);
+            static uint32_t told; static double told_t;
+            if (g_ar_under != told && host_seconds() - told_t > 10.0) {
+                fprintf(stderr, "[dsound] ring ran short %u time(s) (target %u frames)\n", g_ar_under, g_ar_target);
+                told = g_ar_under; told_t = host_seconds();
+            }
+            next = host_seconds();
+            continue;
+        }
         mix_frames(tmp, 441);   /* no stream: 10 ms into nothing, to keep the cursors moving */
         next += 441.0 / MIX_RATE;
         double now = host_seconds();
@@ -519,13 +565,11 @@ W(b_GetCaps) {
 W(b_GetCurrentPosition) {
     SBuf *b = buf(c);
     pthread_mutex_lock(&g_snd_lock);
+    /* The play cursor is where the mixer reads, as on Windows (where it is the card's read position), not what is
+       audible after the output delay: games stream music and voices into the part behind the play cursor, and a
+       cursor held back by the delay (tens of ms, more with bigger device buffers or the callback's ring) made
+       them overwrite data just before it was mixed - crackle that varied with each phone's audio buffer. */
     double ppos = b->pos;
-    {   /* what is audible now is what was mixed g_out_latency output frames ago */
-        double lag = (double)g_out_latency * (double)(b->freq ? b->freq : b->rate) / MIX_RATE;
-        uint32_t nf = frame_bytes(b) ? b->size / frame_bytes(b) : 0;
-        ppos -= lag;
-        if (ppos < 0) ppos = b->looping && nf ? ppos + nf * ceil(-ppos / nf) : 0;
-    }
     uint32_t play = b->primary ? 0 : (uint32_t)ppos * frame_bytes(b);
     pthread_mutex_unlock(&g_snd_lock);
     uint32_t write = b->size ? (play + 4 * frame_bytes(b) * 64) % b->size : 0;  /* write cursor a little ahead */
